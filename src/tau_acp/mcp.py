@@ -8,12 +8,13 @@ import asyncio
 import contextlib
 import json
 import os
+import signal
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from tau_acp import __version__
-from tau_acp.jsonrpc import INVALID_PARAMS, METHOD_NOT_FOUND, RpcError, log
+from tau_acp.jsonrpc import INVALID_PARAMS, METHOD_NOT_FOUND, TOO_LONG, RpcError, log, read_line
 
 PROTOCOL_VERSION = "2025-11-25"
 START_TIMEOUT = 60.0  # the handshake and each tools/list page
@@ -23,6 +24,12 @@ READ_LIMIT = 1 << 26
 
 class McpError(Exception):
     """The server answered a request with a JSON-RPC error."""
+
+
+class McpMalformed(McpError):
+    """The server sent something that is not valid JSON-RPC or MCP. The message completes
+    ``MCP server <name> ...``. The server is not given up on: a line that cannot be read is
+    skipped, and the requests waiting for an answer fail with this."""
 
 
 class McpExited(Exception):
@@ -120,6 +127,7 @@ class McpClient:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 limit=READ_LIMIT,
+                start_new_session=True,  # its own process group, signalled whole when it stops
             )
         except OSError as error:
             raise McpStartError(
@@ -207,29 +215,41 @@ class McpClient:
         stdout = self._process.stdout
         assert stdout is not None
         try:
-            while line := await stdout.readline():
-                self._dispatch(line)
-        except (ValueError, ConnectionError):
-            pass  # an over-long or broken stream: the server is as good as gone
+            while (line := await read_line(stdout)) is not None:
+                if line is TOO_LONG:
+                    self._malformed(f"a line longer than {READ_LIMIT} bytes")
+                else:
+                    self._dispatch(line)
         finally:
             self._exited = True
             for future in self._pending.values():
                 if not future.done():
                     future.set_exception(McpExited(self.name))
 
+    def _malformed(self, why: str) -> None:
+        """A message that cannot be read answers no request in particular, so every request
+        waiting fails with it. The server is still used."""
+        log(f"MCP server {self.name}: sent a malformed message ({why}); its pending requests fail")
+        for future in self._pending.values():
+            if not future.done():
+                future.set_exception(McpMalformed(f"sent a malformed message ({why})"))
+
     def _dispatch(self, line: bytes) -> None:
         try:
             message = json.loads(line)
-        except json.JSONDecodeError:
-            log(f"MCP server {self.name}: ignored a line that is not JSON")
+        except (ValueError, RecursionError):
+            self._malformed("not JSON")
             return
         if not isinstance(message, dict):
+            self._malformed("not a JSON object")
             return
         ident, method = message.get("id"), message.get("method")
         if method is None:
             self._resolve(ident, message)
         elif ident is None:
             log(f"MCP server {self.name}: ignored notification {method}")
+        elif method == "ping":  # a ping is answered whatever else we offer
+            self._write({"jsonrpc": "2.0", "id": ident, "result": {}})
         else:
             error = {"code": METHOD_NOT_FOUND, "message": "tau-acp offers no client capabilities"}
             self._write({"jsonrpc": "2.0", "id": ident, "error": error})
@@ -238,27 +258,37 @@ class McpClient:
         future = self._pending.get(ident) if isinstance(ident, int) else None
         if future is None or future.done():
             return
-        if "error" in message:
-            future.set_exception(McpError(str(message["error"].get("message", message["error"]))))
+        error, result = message.get("error"), message.get("result")
+        if error is not None:
+            if isinstance(error, dict) and isinstance(error.get("message"), str):
+                future.set_exception(McpError(error["message"]))
+            else:
+                future.set_exception(McpMalformed(f"returned a malformed error: {error!r:.80}"))
+        elif isinstance(result, dict):
+            future.set_result(result)
         else:
-            future.set_result(message.get("result") or {})
+            future.set_exception(McpMalformed(f"returned a malformed result: {result!r:.80}"))
 
     async def stop(self) -> None:
-        """Close its stdin, wait, SIGTERM, wait, SIGKILL."""
+        """Close its stdin, wait, SIGTERM, wait, SIGKILL; the signals go to its whole process
+        group, so what it started goes too (also when it exited by itself)."""
         process = self._process
         if process.returncode is None:
             assert process.stdin is not None
             with contextlib.suppress(ConnectionError, RuntimeError):
                 process.stdin.close()
             if not await self._exits():
-                with contextlib.suppress(ProcessLookupError):
-                    process.terminate()
+                self._signal(signal.SIGTERM)
                 if not await self._exits():
-                    with contextlib.suppress(ProcessLookupError):
-                        process.kill()
+                    self._signal(signal.SIGKILL)
                     await process.wait()
+        self._signal(signal.SIGTERM)  # what is left of the group
         self._reader.cancel()
         await asyncio.gather(self._reader, return_exceptions=True)
+
+    def _signal(self, number: signal.Signals) -> None:
+        with contextlib.suppress(ProcessLookupError):  # nothing of the group is left
+            os.killpg(self._process.pid, number)
 
     async def _exits(self) -> bool:
         try:
@@ -269,10 +299,14 @@ class McpClient:
 
 
 def outcome(result: dict[str, Any]) -> dict[str, str]:
-    """A ``tools/call`` result as the relay's reply: ``{"ok": text}`` or ``{"err": text}``."""
+    """A ``tools/call`` result as the relay's reply: ``{"ok": text}`` or ``{"err": text}``.
+    ``McpMalformed`` if the result is not an MCP tool result."""
+    content = result.get("content") or []
+    if not isinstance(content, list) or not all(isinstance(block, dict) for block in content):
+        raise McpMalformed(f"returned a malformed result: content is {content!r:.80}")
     lines: list[str] = []
     texts = 0
-    for block in result.get("content") or []:
+    for block in content:
         if block.get("type") == "text":
             texts += 1
             lines.append(str(block.get("text", "")))

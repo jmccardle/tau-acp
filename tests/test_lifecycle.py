@@ -557,3 +557,24 @@ async def test_eof_releases_every_session(env):
             assert gone(mcp_pid(env, name))
     finally:
         await raw.stop()
+
+
+@scripted
+async def test_a_load_that_fails_after_the_serve_started_holds_and_leaves_nothing(env):
+    elsewhere = env.home / "elsewhere"
+    elsewhere.mkdir()
+    raw = await start(env)
+    try:
+        session = await new(raw, env)
+        await raw.request("session/prompt", prompt(session, "hi"))
+        await raw.request("session/close", {"sessionId": session})
+        params = {"sessionId": session, "cwd": str(elsewhere), "mcpServers": [stdio(env)]}
+        _, response = await raw.request("session/load", params)
+        assert response["error"]["code"] == -32602
+        assert "was started in" in response["error"]["message"]
+        assert env.serve_records() == []  # the serve the load started is stopped
+        _, response = await raw.request("session/prompt", prompt(session, "x"))
+        assert response["error"]["code"] == -32002  # and the session is not held
+        assert list(env.runtime.iterdir()) == []  # nor its relay directory
+    finally:
+        await raw.stop()

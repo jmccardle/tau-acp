@@ -2,16 +2,19 @@
 
 Environment: MCP_LOG, a file it appends one JSON line to for each message it receives and for
 its start (``{"started": pid}``); PAGE_SIZE, to page ``tools/list`` over extra tools
-``tool_0`` .. ``tool_4``; TEST_SECRET, which the ``env`` tool returns.
+``tool_0`` .. ``tool_4``; TEST_SECRET, which the ``env`` tool returns; NO_TOOLS, to declare
+no ``tools`` capability; SPAWN_CHILD, to start a ``sleep`` child and log its pid.
 """
 
 import json
 import os
+import subprocess
 import sys
 import threading
 
 LOG = os.environ["MCP_LOG"]
 PAGE = int(os.environ.get("PAGE_SIZE", "0"))
+NO_TOOLS = bool(os.environ.get("NO_TOOLS"))
 WRITE = threading.Lock()
 CANCELLED: dict[int, threading.Event] = {}
 
@@ -40,6 +43,11 @@ TOOLS = [
     tool("env"),
     tool("die"),
     tool("structured"),
+    tool("ping"),
+    tool("malformed"),
+    tool("malformed_block"),
+    tool("garbage"),
+    tool("huge"),
     *([tool(f"tool_{n}") for n in range(5)] if PAGE else []),
 ]
 
@@ -61,6 +69,17 @@ IMAGE = {"type": "image", "data": "AAAA", "mimeType": "image/png"}
 def call(ident, name, args):
     if name == "die":
         os._exit(3)
+    if name == "ping":  # a server may ping its client; the answer is in the log
+        send({"jsonrpc": "2.0", "id": "ping-1", "method": "ping"})
+        return text("pinged")
+    if name == "garbage":  # a line that is not JSON, and no result
+        sys.stdout.write("this is not json\n")
+        sys.stdout.flush()
+        return None
+    if name == "huge":  # a line over tau-acp's limit, and no result
+        sys.stdout.write("x" * (70 << 20) + "\n")
+        sys.stdout.flush()
+        return None
     if name == "slow":
         threading.Thread(target=slow, args=(ident, args["seconds"]), daemon=True).start()
         return None
@@ -70,6 +89,8 @@ def call(ident, name, args):
         "image": lambda: {"content": [{"type": "text", "text": "before"}, IMAGE]},
         "env": lambda: text(os.environ.get("TEST_SECRET", "unset")),
         "structured": lambda: {"content": [], "structuredContent": {"answer": 42}},
+        "malformed": lambda: {"content": "oops"},
+        "malformed_block": lambda: {"content": [3]},
     }
     return results.get(name, lambda: text(f"called {name}"))()
 
@@ -86,10 +107,12 @@ def tools_list(params):
 
 def handle(message):
     method, ident, params = message.get("method"), message.get("id"), message.get("params") or {}
+    if method is None:  # a response to a request of ours
+        return
     if method == "initialize":
         result = {
             "protocolVersion": params["protocolVersion"],
-            "capabilities": {"tools": {}},
+            "capabilities": {} if NO_TOOLS else {"tools": {}},
             "serverInfo": {"name": "test", "version": "1"},
         }
     elif method == "tools/list":
@@ -110,6 +133,8 @@ def handle(message):
 
 
 log({"started": os.getpid(), "cwd": os.getcwd()})
+if os.environ.get("SPAWN_CHILD"):  # a grandchild, in our process group
+    log({"child": subprocess.Popen(["sleep", "300"]).pid})
 for line in sys.stdin:
     message = json.loads(line)
     log(
@@ -117,6 +142,7 @@ for line in sys.stdin:
             "method": message.get("method"),
             "params": message.get("params") or {},
             "id": message.get("id"),
+            "result": message.get("result"),
         }
     )
     handle(message)

@@ -60,6 +60,26 @@ NotificationHandler = Callable[[str, Params], Awaitable[None]]
 TOO_LONG = b"line too long"
 
 
+async def read_line(reader: asyncio.StreamReader) -> bytes | None:
+    """The next line of the stream, ``TOO_LONG`` for one over the reader's limit (it is discarded
+    through its end, so the next call starts at the next line), None at the end of the stream (or
+    when the transport is lost under it)."""
+    too_long = False
+    while True:
+        try:
+            line = await reader.readuntil(b"\n")
+        except asyncio.IncompleteReadError as end:  # the end of the stream
+            return None if not end.partial or too_long else end.partial
+        except ConnectionError as error:
+            log(f"the stream broke: {type(error).__name__}: {error}")
+            return None
+        except asyncio.LimitOverrunError as over:
+            await reader.readexactly(over.consumed)  # discard what is over the limit
+            too_long = True
+            continue
+        return TOO_LONG if too_long else line
+
+
 def log(text: str) -> None:
     """Log to stderr: stdout carries only protocol messages."""
     print(f"tau-acp: {text}", file=sys.stderr, flush=True)
@@ -92,30 +112,13 @@ class Connection:
         A line longer than the reader's limit is discarded through its end, answered with
         ``-32700`` (id null), and reading goes on with the next line."""
         try:
-            while (line := await self._next_line()) is not None:
+            while (line := await read_line(self._reader)) is not None:
                 if line is TOO_LONG:
                     await self._error(None, RpcError(PARSE_ERROR, "Parse error: line too long"))
                 else:
                     await self._line(line)
         finally:
             await self._shutdown()
-
-    async def _next_line(self) -> bytes | None:
-        """The next line, ``TOO_LONG`` for one over the limit, None at the end of the stream."""
-        too_long = False
-        while True:
-            try:
-                line = await self._reader.readuntil(b"\n")
-            except asyncio.IncompleteReadError as end:  # the end of the stream
-                return None if not end.partial or too_long else end.partial
-            except ConnectionError as error:  # the transport was lost under the reader
-                log(f"the stream broke: {type(error).__name__}: {error}")
-                return None
-            except asyncio.LimitOverrunError as over:
-                await self._reader.readexactly(over.consumed)  # discard what is over the limit
-                too_long = True
-                continue
-            return TOO_LONG if too_long else line
 
     async def request(self, method: str, params: Params) -> Any:
         """Send a request and wait for its response; ``RpcError`` if the peer answered with one."""

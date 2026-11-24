@@ -104,7 +104,7 @@ async def test_paginated_tools_list(env):
         (done,) = editor.of("tool_call_update")
         assert done.content[0].content.text == "called tool_4"
         lists = [e for e in mcp_log(env) if e.get("method") == "tools/list"]
-        assert len(lists) == 4  # 12 tools in pages of 3
+        assert len(lists) == 6  # 17 tools in pages of 3
         assert lists[1]["params"] == {"cursor": "3"}
 
 
@@ -313,3 +313,81 @@ def test_extension_refuses_to_load_without_the_relay(tmp_path):
         )
         assert done.returncode != 0
         assert words in done.stderr
+
+
+# what a server sends that is not what was expected
+
+
+@scripted
+async def test_an_mcp_ping_is_answered_with_an_empty_result(env):
+    async with agent(env, "-e", SCRIPTED) as (conn, editor, _process):
+        await run(conn, env, "mcp__test__ping", mcp_server(env))
+        assert editor.of("tool_call_update")[-1].status == "completed"
+        answer = next(e for e in mcp_log(env) if e.get("id") == "ping-1")
+        assert answer["method"] is None
+        assert answer["result"] == {}
+
+
+@pytest.mark.parametrize("tool", ["malformed", "malformed_block"])
+@scripted
+async def test_a_malformed_tool_result_fails_the_call_and_keeps_the_server(env, tool):
+    async with agent(env, "-e", SCRIPTED) as (conn, editor, _process):
+        session = await run(conn, env, f"mcp__test__{tool}", mcp_server(env))
+        (done,) = editor.of("tool_call_update")
+        assert done.status == "failed"
+        assert "MCP server test returned a malformed result" in done.content[0].content.text
+        editor.forget()  # the server is still in use
+        await conn.prompt(
+            session_id=session.session_id, prompt=[text(call("mcp__test__echo", text="x"))]
+        )
+        assert editor.of("tool_call_update")[-1].status == "completed"
+
+
+@pytest.mark.parametrize(("tool", "why"), [("garbage", "not JSON"), ("huge", "longer than")])
+@scripted
+async def test_a_malformed_line_fails_the_pending_call_not_the_server(env, tool, why):
+    async with agent(env, "-e", SCRIPTED) as (conn, editor, _process):
+        session = await run(conn, env, f"mcp__test__{tool}", mcp_server(env))
+        (done,) = editor.of("tool_call_update")
+        assert done.status == "failed"
+        message = done.content[0].content.text
+        assert "MCP server test sent a malformed message" in message
+        assert why in message
+        assert "exited" not in message
+        editor.forget()  # it is not gone: the next call goes through
+        await conn.prompt(
+            session_id=session.session_id, prompt=[text(call("mcp__test__echo", text="x"))]
+        )
+        (later,) = editor.of("tool_call_update")
+        assert later.status == "completed"
+        assert later.content[0].content.text == "x"
+
+
+# the tools a relay carries
+
+
+@scripted
+async def test_servers_with_no_tools_load_no_extension(env):
+    """τ's tool set is what it is without tau-acp: no -e, no relay environment."""
+    async with agent(env) as (conn, _editor, _process):
+        server = mcp_server(env, NO_TOOLS="1")
+        session = await conn.new_session(cwd=str(env.work), mcp_servers=[server])
+        (record,) = env.serve_records()
+        assert record["session"] == session.session_id
+        pid = record["pid"]
+        assert "TAU_ACP_RELAY" not in Path(f"/proc/{pid}/environ").read_text()
+        assert b"_extension.py" not in Path(f"/proc/{pid}/cmdline").read_bytes()
+        assert [e["method"] for e in mcp_log(env) if e.get("method") == "tools/list"] == []
+
+
+@scripted
+async def test_an_mcp_servers_whole_process_group_is_stopped(env):
+    async with agent(env, "-e", SCRIPTED) as (conn, _editor, _process):
+        session = await conn.new_session(
+            cwd=str(env.work), mcp_servers=[mcp_server(env, SPAWN_CHILD="1")]
+        )
+        child = next(e["child"] for e in mcp_log(env) if "child" in e)
+        assert not gone(child)
+        await conn.close_session(session_id=session.session_id)
+        await until(lambda: gone(mcp_pid(env)), "the server to stop")
+        await until(lambda: gone(child), "its child to stop")

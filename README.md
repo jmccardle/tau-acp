@@ -22,8 +22,9 @@ Works now:
 - Streamed replies and thinking, tool calls with their results and live output, and τ's
   notices.
 - Tool permissions: when τ asks (for example with a `permissions.ask` rule), the editor gets a
-  `session/request_permission` with allow once / always allow / reject. Any other question τ
-  asks is declined, with a line in the chat saying so.
+  `session/request_permission` with allow once / always allow / reject. The request always shows
+  the question's own text, and names the tool call only when the text identifies exactly one.
+  Any other question τ asks is declined, with a line in the chat saying so.
 - τ's slash commands (`/usage`, `/model NAME`, ...) are advertised to the editor and run when
   typed. An unknown `/word` goes to the model as text.
 - Closing stdin (or SIGTERM) stops every `tau serve` it started and exits 0.
@@ -74,12 +75,21 @@ tau-acp -- -e /path/to/extension.py
 - A `tau serve` stops when tau-acp exits. The session's log stays on disk, so `session/load`
   can come back to it. A session that never received a prompt is discarded by τ when its serve
   stops, so there is nothing to load.
+- `session/load` and `session/resume` take a session's full id. (τ accepts a prefix or a name
+  on its own command line; the editor's key would then not be the session's, so it is `-32002`.)
+- tau-acp only stops a serve that is still the one it started: if a session's serve died and
+  something else serves the id now, closing the session leaves that alone.
 - If another process already serves a session, `session/load` fails with an error naming its
   pid and the `tau serve --stop --session ID` command. tau-acp never attaches to a serve it did
   not start.
 - A turn ends when τ's cursor rests. Stop reasons: `end_turn`, `max_tokens` and `refusal` from the
   last reply, `cancelled` after `session/cancel`. A failed or halted step is a JSON-RPC error
-  (-32603) carrying τ's message.
+  (-32603) carrying τ's message. A prompt that was cancelled answers `cancelled` whatever
+  fails after the cancel.
+- Malformed input does not stop tau-acp: a bad response from the editor fails that one request,
+  and a bad or over-long line from the editor or an MCP server is skipped and answered or failed
+  (see DESIGN.md).
+- A running tool's `in_progress` updates carry the last 65,536 characters of its output.
 
 ## Development
 
@@ -87,7 +97,7 @@ tau-acp -- -e /path/to/extension.py
 python3.12 -m venv .venv
 .venv/bin/pip install -U pip            # pip >= 25.1 for --group
 .venv/bin/pip install -e . --group dev
-PATH=$PWD/.venv/bin:$PATH scripts/check.sh   # ruff check, ruff format --check, pytest
+PATH=$PWD/.venv/bin:$PATH scripts/check.sh   # ruff check, ruff format --check, radon (CC <= 15), pytest
 ```
 
 The tests run real processes: `python -m tau_acp` spawning real `tau serve` processes on τ's

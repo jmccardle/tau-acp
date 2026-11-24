@@ -120,8 +120,19 @@ editor ──stdio (ACP JSON-RPC)──> tau-acp ──Unix socket (τ wire, Rem
 - **Failures:** any failure (spawn, handshake, list, a 60-second timeout of either) ends the ACP
   request with `-32603` and an error naming the server. Servers already started are stopped.
   `tools/list` is only sent when the server declared `capabilities.tools`. `env` values never appear in errors or logs.
+- **What a server sends that is wrong:**
+  - A line that is not a JSON object, or is over 64 MiB (it is discarded through its newline),
+    fails every request waiting on that server with `MCP server <name> sent a malformed message
+    (...)`, because it cannot be told which request it answered. The server is *not* given up
+    on: its later requests go through.
+  - A response whose `error` or `result` is not an object, and a tool result whose `content` is
+    not a list of objects, fails that one call with `MCP server <name> returned a malformed
+    result`.
+  - A request from the server is answered `-32601`, except `ping`, which is answered with `{}`.
+  - "MCP server <name> exited" is said only when the process's stream really ended.
 - **Lifetime:** the servers live as long as the ACP session. They are stopped (stdin closed,
-  then SIGTERM, then SIGKILL after a grace period) on session close or bridge exit.
+  then SIGTERM, then SIGKILL after a grace period) on session close or bridge exit. Each runs in
+  its own process group, and the signals go to the group, so what the server started stops with it.
 - **Server names** must be unique within one request (`-32602`).
 - **`http`/`sse` entries:** these get a `-32602` error ("tau-acp supports stdio MCP servers only"). tau-acp advertises
   `mcpCapabilities: {http: false, sse: false}`.

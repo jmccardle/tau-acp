@@ -20,7 +20,7 @@ dependencies = [
 tau-acp = "tau_acp.cli:main"
 
 [dependency-groups]
-dev = ["pytest", "ruff", "agent-client-protocol==1.0.0"]
+dev = ["pytest", "ruff", "radon", "agent-client-protocol==1.0.0"]
 
 [tool.hatch.version]
 path = "src/tau_acp/__init__.py"

@@ -19,6 +19,7 @@ from tau_acp.mcp import (
     McpClient,
     McpError,
     McpExited,
+    McpMalformed,
     McpSpec,
     McpStartError,
     McpTool,
@@ -126,7 +127,14 @@ class Relay:
 
     async def _serve_one(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         """One call: the request line, the MCP call; if the peer closes first, the cancel."""
-        line = await reader.readline()
+        try:
+            line = await reader.readline()
+        except ValueError:  # over the limit
+            writer.write(
+                json.dumps({"err": "tau-acp relay: the call is too long"}).encode() + b"\n"
+            )
+            await writer.drain()
+            return
         if not line:
             return
         call = asyncio.ensure_future(self._call(line))
@@ -152,6 +160,8 @@ class Relay:
             return outcome(await server.call(tool, arguments))
         except McpExited as error:
             return {"err": str(error)}
+        except McpMalformed as error:  # "sent a malformed message ...", "returned a malformed ..."
+            return {"err": f"MCP server {server.name} {error}"}
         except McpError as error:
             return {"err": f"MCP server {server.name}: {error}"}
 
