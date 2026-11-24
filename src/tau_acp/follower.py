@@ -17,7 +17,9 @@ from tau import (
     Appended,
     Body,
     Client,
+    ConfigError,
     CursorView,
+    Ending,
     Event,
     Live,
     Notice,
@@ -68,6 +70,7 @@ class Follower:
         self._model_changed = editor.model_changed
         self._stepped = False
         self._last_stop: Stop | None = None
+        self._replies = 0  # the Assistant nodes of the prompt
         self._text = ""
         self._thought = ""
         self._progress: dict[tuple[int, str], str] = {}
@@ -149,6 +152,7 @@ class Follower:
         """Start a prompt. (``cancelled`` is the caller's: a cancel can come before this.)"""
         self._stepped = False
         self._last_stop = None
+        self._replies = 0
 
     # A prompt
 
@@ -197,7 +201,13 @@ class Follower:
         if self.cancelled:  # the cancel came while the input was going in
             await self._client.abort(self._cursor)
         view = await self._rest()
-        return translate.stop_reason(view, self._last_stop, message=True, cancelled=self.cancelled)
+        return translate.stop_reason(
+            view,
+            self._last_stop,
+            message=True,
+            cancelled=self.cancelled,
+            limited=await self._limited(view),
+        )
 
     async def _command(self, parsed: Parsed) -> str:
         if self.view.busy:
@@ -209,7 +219,31 @@ class Follower:
             await self._emit(translate.chunk("agent_message_chunk", result))
         if not self._stepped:
             return "cancelled" if self.cancelled else "end_turn"
-        return translate.stop_reason(view, self._last_stop, message=False, cancelled=self.cancelled)
+        return translate.stop_reason(
+            view,
+            self._last_stop,
+            message=False,
+            cancelled=self.cancelled,
+            limited=await self._limited(view),
+        )
+
+    async def _limited(self, view: CursorView) -> bool:
+        """Whether τ's step limit (the ``step_limit`` extension) turned auto-step off at the end of
+        the prompt. Its mark: the cursor rested done with nothing pending and auto-step off after
+        a reply that called tools, and the prompt's reply count is a multiple of the limit (it
+        turns auto-step off after ``limit`` steps, each one reply, then counts again). A session
+        without the extension has no step limit. Anything else that turned auto-step off (a hook,
+        a step that did not move) is not this."""
+        if view.auto or view.items or not isinstance(view.ending, Ending.Done):
+            return False
+        if self._last_stop != Stop.Tools or self._replies == 0:
+            return False
+        try:
+            form = await self._client.options(self._cursor, "step_limit")
+        except ConfigError:  # not loaded: no step limit
+            return False
+        limit = form.schema["properties"]["limit"]["default"]
+        return self._replies % limit == 0
 
     async def set_model(self, name: str) -> None:
         """Run τ's ``model`` command, hearing events meanwhile; ``RpcError`` if τ refuses."""
@@ -325,6 +359,7 @@ class Follower:
             updates = translate.assistant_updates(node, self._cwd, self._text, self._thought)
             self._text = self._thought = ""
             self._last_stop = body.stop
+            self._replies += 1
         elif isinstance(body, Body.Results):
             updates = translate.results_updates(node)
         elif isinstance(body, Body.User) and not translate.is_own(node, self._client.id):

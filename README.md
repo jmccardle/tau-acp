@@ -41,7 +41,8 @@ Limits, by decision:
 
 - MCP servers are stdio only (`http`/`sse` are refused).
 - No `fs/*` or `terminal/*` client methods: τ's own tools work on the local files.
-- No image or audio prompts.
+- No image or audio prompts. An image a τ tool returns shows as a line, `[image WxH mime]`,
+  after the result's text: τ's wire does not carry an image's bytes yet.
 - Unstable ACP methods (`session/fork` and others) are not supported.
 - Local only: tau-acp, its `tau serve` processes and the files are on one machine, and there is
   no network transport. A session some other process serves is never attached to.
@@ -51,7 +52,7 @@ Limits, by decision:
 ## Setup
 
 ```bash
-pip install ffwf-tau-acp        # brings ffwf-tau 0.16
+pip install ffwf-tau-acp        # brings ffwf-tau 0.17
 ```
 
 τ needs a model: set `default_model` in its config (`$TAU_HOME/config.json`, default

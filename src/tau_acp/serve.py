@@ -48,6 +48,13 @@ class Serve:
         self._child = child
         self._drain = asyncio.ensure_future(_drain(child.process))
 
+    def exited(self) -> str | None:
+        """How it exited, if it has (before ``stop``: on its own, or by someone else's hand)."""
+        if self._child.running():
+            return None
+        code = self._child.process.returncode
+        return "exited" if code is None else f"exited with status {code}"
+
     async def stop(self) -> None:
         """SIGTERM it and wait for it to exit; after ``STOP_WAIT_SECONDS``, SIGKILL it and raise
         ``ServeError``. Nothing is signalled if it has exited already."""

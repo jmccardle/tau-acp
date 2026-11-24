@@ -66,6 +66,12 @@ class Session:
             self._dead = f"tau serve for session {self.id} exited: {self._follower.lost}"
         return self._dead
 
+    def gone(self) -> str | None:
+        """``dead``, or, when nothing has found that yet, whether the serve's process has exited."""
+        if self.dead is None and (how := self.serve.exited()) is not None:
+            self._dead = f"tau serve for session {self.id} {how}"
+        return self.dead
+
     async def emit(self, update: translate.Update) -> None:
         """Send a ``session/update``."""
         await self._conn.notify("session/update", {"sessionId": self.id, "update": update})

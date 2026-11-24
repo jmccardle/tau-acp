@@ -171,6 +171,28 @@ async def test_close_releases_everything(env):
 
 
 @scripted
+async def test_closing_a_session_whose_serve_died_is_an_error_and_releases_everything(env):
+    raw = await start(env, "-e", SCRIPTED)
+    try:
+        session = await new(raw, env, [mcp_server(env)])
+        serve, mcp = serve_pid(env, session), mcp_pid(env)
+        os.kill(serve, signal.SIGKILL)  # by its recorded pid; nothing has asked it anything since
+        await until(lambda: gone(serve), "the serve to exit")
+        _, response = await raw.request("session/close", {"sessionId": session})
+        error = response["error"]
+        assert error["code"] == -32603
+        assert "exited" in error["message"]
+        assert "the session is closed" in error["message"]
+        assert error["data"] == {"sessionId": session}
+        await until(lambda: gone(mcp), "the MCP server to stop")
+        assert not any(env.runtime.iterdir())  # the relay directory
+        _, response = await raw.request("session/close", {"sessionId": session})
+        assert response["result"] == {}  # it is not held any more
+    finally:
+        await raw.stop()
+
+
+@scripted
 async def test_close_during_a_prompt_answers_cancelled(env):
     async with agent(env, "-e", SCRIPTED) as (conn, _editor, _process):
         session = await conn.new_session(cwd=str(env.work), mcp_servers=[mcp_server(env)])
@@ -395,7 +417,8 @@ async def test_closing_a_dead_session_does_not_stop_the_serve_that_replaced_it(e
         other = await other_serve(env, session)  # someone else serves the session now
         assert other != pid
         _, response = await raw.request("session/close", {"sessionId": session})
-        assert response["result"] == {}
+        assert response["error"]["code"] == -32603  # what ran in it was lost
+        assert "exited" in response["error"]["message"]
         await asyncio.sleep(1.5)  # a wrong stop is not instant
         assert not gone(other)
         assert await raw.eof() == 0
@@ -519,7 +542,8 @@ async def test_close_releases_everything_when_the_serve_dies_during_it(env):
         await asyncio.sleep(0.5)
         os.kill(pid, signal.SIGKILL)  # ... until the connection is lost
         _, response = await closing
-        assert response["result"] == {}
+        assert response["error"]["code"] == -32603  # the serve died: the turn in it was lost
+        assert "the session is closed" in response["error"]["message"]
         await until(lambda: gone(mcp), "the MCP server to stop")
         assert list(env.runtime.iterdir()) == []
     finally:

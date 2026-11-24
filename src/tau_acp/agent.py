@@ -159,14 +159,23 @@ class Agent:
         return {"sessions": await catalog.list_sessions(cwd)}
 
     async def _close(self, params: Params) -> dict[str, Any]:
+        """Release the session whatever happens. A serve that was already gone is an error all
+        the same (once everything is released): what ran in it was lost."""
         session = self._sessions.pop(_string(params, "sessionId"), None)
-        if session is not None:
-            try:
-                await session.cancel_and_wait()  # the prompt in flight answers `cancelled`
-            except Exception as error:  # the serve is gone: closing is what was asked
-                log(f"session {session.id}: closing: {error!r}")
-            finally:
-                await self._release(session)
+        if session is None:
+            return {}
+        gone = session.gone()
+        try:
+            await session.cancel_and_wait()  # the prompt in flight answers `cancelled`
+        except Exception as error:
+            log(f"session {session.id}: closing: {error!r}")
+            gone = session.gone() or f"closing session {session.id} failed: {error}"
+        finally:
+            await self._release(session)
+        if gone is not None:
+            raise RpcError(
+                INTERNAL_ERROR, f"{gone} (the session is closed)", {"sessionId": session.id}
+            )
         return {}
 
     async def _set_config_option(self, params: Params) -> dict[str, Any]:

@@ -160,11 +160,19 @@ def tool_progress(identity: str, text: str) -> Update:
     }
 
 
+def ok_text(outcome: Outcome.Ok) -> str:
+    """A result's text, then a line per image it returned, as τ's own TUI shows them:
+    ``[image WxH mime]``. τ's wire carries an image's reference, not its bytes, so it cannot be
+    sent as an ACP image block."""
+    lines = [f"[image {i.width}x{i.height} {i.mime}]" for i in outcome.images]
+    return "\n".join([outcome.value, *lines]) if lines else outcome.value
+
+
 def outcome_update(node: int, call: str, outcome: Any) -> Update:
     """The ``tool_call_update`` for the outcome of a call."""
     identity = call_id(node, call)
     if isinstance(outcome, Outcome.Ok):
-        return tool_text(identity, "completed", outcome.value)
+        return tool_text(identity, "completed", ok_text(outcome))
     if isinstance(outcome, Outcome.Err):
         return tool_text(identity, "failed", outcome.error)
     return tool_text(identity, "failed", "interrupted")
@@ -352,10 +360,18 @@ def permission_tool_call(
 # Stop reasons
 
 
-def stop_reason(view: CursorView, last_stop: Stop | None, *, message: bool, cancelled: bool) -> str:
+def stop_reason(
+    view: CursorView,
+    last_stop: Stop | None,
+    *,
+    message: bool,
+    cancelled: bool,
+    limited: bool = False,
+) -> str:
     """The ACP stop reason for the cursor's resting view. ``last_stop`` is the stop of the turn's
     last Assistant node, ``message`` whether the turn sent input (which must have been taken up),
-    ``cancelled`` whether the client cancelled it. ``TurnError`` for an ending ACP cannot carry."""
+    ``cancelled`` whether the client cancelled it, ``limited`` whether τ's step limit stopped it
+    (``max_turn_requests``). ``TurnError`` for an ending ACP cannot carry."""
     if cancelled:
         return "cancelled"
     ending = view.ending
@@ -369,10 +385,11 @@ def stop_reason(view: CursorView, last_stop: Stop | None, *, message: bool, canc
         raise TurnError("the cursor rested with no recorded ending")
     if message and view.items:
         raise TurnError("stopped before finishing: the message is still pending")
+    if limited:
+        return "max_turn_requests"
     if message and not view.auto:
         raise TurnError(
-            "stopped before finishing: auto-step is off "
-            "(a step limit, a hook, or a step that did not move)"
+            "stopped before finishing: auto-step is off (a hook, or a step that did not move)"
         )
     return _stop(last_stop, message=message)
 

@@ -42,11 +42,16 @@ class Env:
     home: Path
     work: Path
 
-    def configure(self, **options: Any) -> None:
+    def configure(self, extensions: dict[str, Any] | None = None, **options: Any) -> None:
         """Write τ's config: the mock models ``m`` (the default) and ``m2``, with these provider
-        options."""
+        options, and ``extensions`` (the extensions' options) if given."""
         model = {"model": "m", "provider": "mock", "options": {"delay_ms": 0, **options}}
-        config = {"default_model": "m", "models": {"m": model, "m2": {**model, "model": "m2"}}}
+        config: dict[str, Any] = {
+            "default_model": "m",
+            "models": {"m": model, "m2": {**model, "model": "m2"}},
+        }
+        if extensions is not None:
+            config["extensions"] = extensions
         (self.home / "config.json").write_text(json.dumps(config))
 
     @property

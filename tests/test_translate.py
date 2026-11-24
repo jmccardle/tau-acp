@@ -1,9 +1,22 @@
 """The pure translation functions, on τ's public value types."""
 
 import json
+import struct
+import zlib
 
 import pytest
-from tau import Author, Body, CursorView, Ending, Form, OpenQuestion, Outcome, Part, Stop
+from tau import (
+    Author,
+    Body,
+    CursorView,
+    Ending,
+    Form,
+    Image,
+    OpenQuestion,
+    Outcome,
+    Part,
+    Stop,
+)
 
 from tau_acp import translate
 
@@ -240,6 +253,27 @@ def test_a_message_must_have_been_taken_up():
     assert translate.stop_reason(done, None, message=False, cancelled=False) == "end_turn"
 
 
+def test_the_step_limit_is_max_turn_requests():
+    rested = view(Ending.Done(), auto=False)
+    for message in (True, False):
+        reason = translate.stop_reason(
+            rested, Stop.Tools, message=message, cancelled=False, limited=True
+        )
+        assert reason == "max_turn_requests"
+    assert (  # a cancel wins
+        translate.stop_reason(rested, Stop.Tools, message=True, cancelled=True, limited=True)
+        == "cancelled"
+    )
+    with pytest.raises(translate.TurnError, match="still pending"):
+        translate.stop_reason(
+            view(Ending.Done(), auto=False, items=(1,)),
+            Stop.Tools,
+            message=True,
+            cancelled=False,
+            limited=True,
+        )
+
+
 def test_an_unusable_last_stop_is_an_error():
     with pytest.raises(translate.TurnError, match="no reply"):
         translate.stop_reason(view(Ending.Done()), None, message=True, cancelled=False)
@@ -317,3 +351,30 @@ def test_an_ambiguous_question_is_shown_whole():
     tricky = Part.Call("c2", "bash", json.dumps({"command": "x\n(ask rule: y)\nz"}))
     update = asked("bash: x\n(ask rule: y)\nz\n(ask rule: bash)", plain, tricky)
     assert update["toolCallId"] == "question:0"
+
+
+def png(width: int, height: int) -> bytes:
+    """A valid PNG of ``width`` x ``height`` black pixels."""
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        body = kind + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body))
+
+    rows = b"".join(b"\0" + b"\0" * (3 * width) for _ in range(height))
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(rows))
+        + chunk(b"IEND", b"")
+    )
+
+
+def test_images_in_a_result_are_a_line_each_after_its_text():
+    images = [Image(png(3, 2)), Image(png(1, 1))]
+    update = translate.outcome_update(3, "c1", Outcome.Ok("two pictures", images))
+    shown = "two pictures\n[image 3x2 image/png]\n[image 1x1 image/png]"
+    assert update["status"] == "completed"
+    assert update["content"] == [{"type": "content", "content": {"type": "text", "text": shown}}]
+    assert update["rawOutput"] == shown
+    assert translate.ok_text(Outcome.Ok("no pictures")) == "no pictures"

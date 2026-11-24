@@ -28,6 +28,9 @@ whichever one is wrong. Never paper over the difference.
   the right tools, and ACP v2 removes these methods anyway.
 - `http`/`sse` MCP servers.
 - `image`/`audio` prompts.
+- Images in tool results as ACP `image` content blocks: an ACP image needs its bytes, and τ 0.17's
+  wire carries only an image's reference. When τ's `Client` can fetch an image's bytes (D30's
+  next slice), a result's images can go as `image` blocks after its text.
 - `elicitation/create`.
 
 **τ itself is never changed.** tau-acp uses only τ's public API (`tau`, `tau.cli`). If a
@@ -71,7 +74,7 @@ editor ──stdio (ACP JSON-RPC)──> tau-acp ──Unix socket (τ wire, Rem
     that is under way finish, then stops the serve it started, so none is orphaned.
   - **`session/close` and shutdown always release everything:** if the serve is already gone
     and the abort fails, that is logged, and the MCP servers and the relay directory are still
-    released. Shutdown releases the sessions together, and one session's failure does not
+    released; `session/close` then answers `-32603` (the session is closed all the same). Shutdown releases the sessions together, and one session's failure does not
     skip another's.
   - **Signals:** SIGTERM, SIGINT and SIGHUP (the terminal closed) each start the shutdown. From
     the moment the shutdown starts (a signal, or stdin closing), those three are ignored, so
@@ -168,7 +171,7 @@ editor ──stdio (ACP JSON-RPC)──> tau-acp ──Unix socket (τ wire, Rem
 | `session/load` | A1 | starts the serve with `--session ID`, then replays the history ("Replay") before answering. An unknown id gets `-32002`, and so does anything but a session's full id: τ's `--session` also takes an id prefix or a name, but then the serve's session is not the key the editor used. The id is resolved with `tau.find_session` before anything starts, and anything but an exact id is answered `-32002` with `data.sessionId` (naming the session τ would have opened, if any). The record's session is checked again once the serve is up. A `cwd` that differs from τ's record gets `-32602` (checked once the serve is up, because the record is only known then; a serve started for the check is stopped). A session this connection already holds is replayed, not restarted, if its `mcpServers` are the same (name, command, args, env); if they differ the answer is `-32602` ("session X is already open with different MCP servers; close it first"), because keeping the old tools silently would be wrong. A held session whose serve died is released and started again. Results carry `configOptions`. |
 | `session/list` | A3 | `tau.list_sessions($TAU_HOME/sessions, cwd=…)`. Each session is `{sessionId, cwd, title?, updatedAt}`: `title` is τ's name, else the first message cut to one line of at most 80 characters, else omitted; `updatedAt` is the log's modification time, ISO 8601 UTC. `cwd` (when given) must be an absolute directory and filters exactly. No paging: no `nextCursor`, and any `cursor` that is not null gets `-32602` ("tau-acp does not page session/list"). A directory that is not a readable session (τ gives it an `error`) is left out, because ACP requires a `cwd` and the editor could not load it; each one is logged to stderr, so it is never silent. τ has no public function for `TAU_HOME`, so tau-acp reads `$TAU_HOME` (a leading `~` is `$HOME`, relative is an error), else `~/.tau`, as τ documents. |
 | `session/resume` | A3 | the same as load, without the replay. It still sends `available_commands_update` and returns `configOptions`. |
-| `session/close` | A3 | cancels the prompt in flight (which answers `cancelled`), then stops the serve, the MCP servers and the relay directory. `{}` for an unknown or already closed session. |
+| `session/close` | A3 | cancels the prompt in flight (which answers `cancelled`), then stops the serve, the MCP servers and the relay directory. `{}`; `{}` too for an unknown or already closed session. If the serve was already gone (found dead, or its process had exited) or dies during the close, everything is released all the same, and the answer is `-32603` naming why, "(the session is closed)", with `data {sessionId}`: what ran in the serve was lost. |
 | `session/set_config_option` | A3 | the one option, `model`: a `select`, `category: "model"`, `currentValue` = `CursorView.model`, options from `complete(cursor, "model", "")` (each `value` and `name` is τ's model name; if the current model is not among them it is added first, since it is a real value). An unknown `configId`, a non-select `type`, or a value that is not an option gets `-32602`. Otherwise τ's `model` command runs (as a task while events are read) and the answer is the full `configOptions`. A model change that comes from τ's side (a `/model` in a prompt) sends `config_option_update` with the full set; one the editor asked for does not (the answer carries it). If τ names no model (`CursorView.model` is `None`), `configOptions` is left out of the results and the option is not offered. |
 
 - Unknown methods get `-32601`. Unknown notifications are ignored. Any request before
@@ -219,8 +222,14 @@ editor ──stdio (ACP JSON-RPC)──> tau-acp ──Unix socket (τ wire, Rem
    - `None` → JSON-RPC error `-32603` with "the cursor rested with no recorded ending".
    - `Ending.Done` → use the turn's last Assistant node's `stop`: `End` → `end_turn`;
      `Length` → `max_tokens`; `Refused` → `refusal`; anything else → `-32603` naming it.
-     Before that, if pending `items` remain or auto-step is off, the result is `-32603` with
-     "stopped before finishing: …" (τ's `tau -p` verdict).
+     Before that, if pending `items` remain, the result is `-32603` with "stopped before
+     finishing: …" (τ's `tau -p` verdict). Then **τ's step limit** → `max_turn_requests`: the
+     `step_limit` extension turns auto-step off after `limit` steps, each one reply. Its mark is
+     auto-step off after a reply that called tools (`Stop.Tools`), with the prompt's reply count
+     a multiple of the limit (read with `Client.options(cursor, "step_limit")`; the extension
+     counts again after it fires). Any other auto-step off (a hook, a step that did not move,
+     or no `step_limit` loaded) is `-32603` "stopped before finishing: auto-step is off". A
+     hook that turns auto-step off on exactly such a step cannot be told from the limit.
    - After `session/cancel`, the answer is always `cancelled`, as ACP requires, whatever fails
      after the cancel (the stream, a command, the stop reason). If the failure was the serve's
      stream ending, the session is still marked dead. A cancel that comes while the prompt's
@@ -239,7 +248,7 @@ editor ──stdio (ACP JSON-RPC)──> tau-acp ──Unix socket (τ wire, Rem
 | `Live(ThinkingDelta)` | `agent_thought_chunk` |
 | `Appended` Assistant node | the node's text (its text parts joined) not already streamed goes as `agent_message_chunk` (thinking the same way, as `agent_thought_chunk`, without the visible line): if the streamed text is a prefix, only the rest is sent; if not, the final text is sent with a visible `[tau-acp: the streamed text was incomplete; the final text follows]` line in front. Each `Part.Call` → `tool_call`. |
 | `Appended` User node from another author (a hook, an extension) | `user_message_chunk` |
-| `Appended` Results node | `tool_call_update`, status `completed` (`Ok`) or `failed` (`Err`, `Interrupted`), with the text as `content`, and `rawOutput` |
+| `Appended` Results node | `tool_call_update`, status `completed` (`Ok`) or `failed` (`Err`, `Interrupted`), with the text as `content`, and `rawOutput`. An `Ok` with images (τ's protocol 2) adds a line per image after its text, `[image WxH mime]`, as τ's TUI shows it: τ's wire carries an image's reference (mime, sha256, size), not its bytes, so it cannot be an ACP `image` block. |
 | `Live(ToolProgress)` | `tool_call_update`, status `in_progress`, with the **last 65,536 characters** of the output so far as `content`. (A running call's output can grow without bound; resending all of it for every chunk would be quadratic. The complete output is in the final `completed` update.) |
 | `Notice(text)` | `agent_message_chunk` with the text `\n[τ] <text>\n` |
 | an open question | see "Questions" |
