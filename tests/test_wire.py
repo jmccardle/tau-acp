@@ -1,6 +1,11 @@
 import asyncio
 import json
+import os
+import socket
+import subprocess
+import sys
 
+from tau_acp.jsonrpc import Connection
 from tests.harness import SCRIPTED, Raw, gone, scripted, until
 
 PROMPT = {"type": "text"}
@@ -240,3 +245,167 @@ async def test_sigterm_stops_the_serves_too(env):
         await until(lambda: gone(pid), "the serve to stop", 10)
     finally:
         await agent.stop()
+
+
+# what the editor sends wrongly must not stop the agent
+
+
+def request_for(raw_message: dict) -> bytes:
+    return json.dumps({"jsonrpc": "2.0", **raw_message}).encode()
+
+
+async def ask_permission(raw, env, answer: dict):
+    """Run a prompt that asks the editor for permission, and answer that request with ``answer``
+    (its ``id`` is filled in); the prompt's response."""
+    await raw.request("initialize", {"protocolVersion": 1})
+    _, response = await raw.request("session/new", {"cwd": str(env.work), "mcpServers": []})
+    session = response["result"]["sessionId"]
+    raw.last_id += 1
+    waiting = raw.last_id
+    line = 'call bash {"command": "echo hi"}'
+    await raw.write(
+        request_for(
+            {"id": waiting, "method": "session/prompt", "params": prompt(session, line)},
+        )
+    )
+    while True:
+        got = await raw.read()
+        if got.get("method") == "session/request_permission":
+            await raw.write(request_for({"id": got["id"], **answer}))
+        elif got.get("id") == waiting:
+            return session, got
+
+
+@scripted
+async def test_a_malformed_error_response_fails_only_its_request(env):
+    for bad in (
+        {"code": -32000},  # no message
+        "boom",  # not an object
+        {"code": "x", "message": "m"},
+        {"code": 1, "message": 3},
+        None,
+    ):
+        raw = await Raw.start(env, "-e", SCRIPTED, "--set", 'permissions.ask=["bash"]')
+        try:
+            session, got = await ask_permission(raw, env, {"error": bad})
+            assert got["result"] == {"stopReason": "end_turn"}, bad  # declined: the call failed
+            assert not (env.work / "marker").exists()
+            assert raw.process.returncode is None, bad  # and tau-acp is still there
+            _, response = await raw.request("session/prompt", prompt(session, "again"))
+            assert response["result"] == {"stopReason": "end_turn"}
+        finally:
+            await raw.stop()
+            env.kill_serves()
+
+
+@scripted
+async def test_a_response_with_neither_result_nor_error_is_a_cancelled_answer(env):
+    raw = await Raw.start(env, "-e", SCRIPTED, "--set", 'permissions.ask=["bash"]')
+    try:
+        _, got = await ask_permission(raw, env, {})
+        assert got["result"] == {"stopReason": "end_turn"}
+        assert raw.process.returncode is None
+    finally:
+        await raw.stop()
+        env.kill_serves()
+
+
+async def pair(limit: int, on_request):
+    """A ``Connection`` with a small line limit, and the peer's end of it."""
+    a, b = socket.socketpair()
+    reader, writer = await asyncio.open_connection(sock=a, limit=limit)
+    peer_reader, peer_writer = await asyncio.open_connection(sock=b)
+
+    async def nobody(_method, _params):
+        return None
+
+    connection = Connection(reader, writer, on_request, nobody)
+    return connection, asyncio.ensure_future(connection.run()), peer_reader, peer_writer, b
+
+
+@scripted
+async def test_an_overlong_line_is_answered_and_reading_goes_on(env):
+    async def echo(method, _params):
+        return {"method": method}
+
+    _connection, running, peer, out, _sock = await pair(1000, echo)
+    out.write(b"x" * 5000 + b"\n")  # five times the limit, then a good request
+    out.write(request_for({"id": 1, "method": "first", "params": {}}) + b"\n")
+    out.write(b'{"jsonrpc": "2.0", "id": 2, "method": "a", "params": {"p": "' + b"y" * 3000)
+    out.write(b'"}}\n' + request_for({"id": 3, "method": "third", "params": {}}) + b"\n")
+    await out.drain()
+    seen = [json.loads(await asyncio.wait_for(peer.readline(), 10)) for _ in range(4)]
+    assert seen[0]["error"]["code"] == -32700
+    assert seen[0]["id"] is None
+    # (answers are written by tasks, so their order against the second error is not fixed)
+    for ident, method in ((1, "first"), (3, "third")):
+        assert {"jsonrpc": "2.0", "id": ident, "result": {"method": method}} in seen
+    assert [m["error"]["code"] for m in seen if "error" in m] == [-32700, -32700]  # one per line
+    out.close()
+    await asyncio.wait_for(running, 10)  # the end of the stream still ends it
+
+
+@scripted
+async def test_a_peer_that_is_gone_ends_the_connection_without_an_error(env):
+    sent = asyncio.Event()
+
+    async def late(_method, _params):
+        await sent.wait()
+        return {}
+
+    _connection, running, _peer, out, sock = await pair(1 << 20, late)
+    out.write(request_for({"id": 1, "method": "slow", "params": {}}) + b"\n")
+    await out.drain()
+    await asyncio.sleep(0.1)
+    sock.shutdown(socket.SHUT_RD)  # the peer stops reading, but its end stays open: no EOF
+    sent.set()  # the answer cannot be written
+    await asyncio.wait_for(running, 10)  # run() returns, though the stream has not ended
+
+
+@scripted
+async def test_an_editor_that_stops_reading_ends_tau_acp_cleanly(env):
+    """stdout closed while tau-acp writes: the editor is gone, which is not a serve exiting."""
+    env.configure(delay_ms=300, reply="one two three four five six seven eight")
+    process = subprocess.Popen(
+        [sys.executable, "-m", "tau_acp"],
+        cwd=env.work,
+        env={**os.environ, **env.environ},
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    def send(message: dict) -> None:
+        process.stdin.write(json.dumps({"jsonrpc": "2.0", **message}).encode() + b"\n")
+        process.stdin.flush()
+
+    def receive() -> dict:
+        return json.loads(process.stdout.readline())
+
+    try:
+        send({"id": 1, "method": "initialize", "params": {"protocolVersion": 1}})
+        assert receive()["id"] == 1
+        send({"id": 2, "method": "session/new", "params": {"cwd": str(env.work), "mcpServers": []}})
+        while "result" not in (got := receive()):
+            pass
+        send(
+            {
+                "id": 3,
+                "method": "session/prompt",
+                "params": prompt(got["result"]["sessionId"], "go"),
+            }
+        )
+        while receive().get("method") != "session/update":
+            pass
+        process.stdout.close()  # the editor stops reading; stdin stays open
+        code = await asyncio.get_running_loop().run_in_executor(None, process.wait, 40)
+        assert code == 0
+        error = process.stderr.read().decode()
+        assert "tau serve for session" not in error
+        assert "the editor is gone" in error
+        assert env.serve_records() == []  # its sessions are closed
+    finally:
+        process.kill()
+        process.wait()
+        for pipe in (process.stdin, process.stderr):
+            pipe.close()

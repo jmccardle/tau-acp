@@ -145,6 +145,14 @@ editor ──stdio (ACP JSON-RPC)──> tau-acp ──Unix socket (τ wire, Rem
 - Only one prompt per session can be in flight. A second one gets `-32602` ("a prompt is already
   running").
 - Logs go to stderr. Stdout carries only ACP messages.
+- **A peer's mistakes never stop tau-acp.**
+  - A response from the editor whose `error` is not `{code: integer, message: string}` fails that one request
+    (`-32603` naming the malformed error); it is logged, and reading goes on.
+  - A line over the 64 MiB limit is discarded through its end and answered `-32700` (id null);
+    reading goes on with the next line. (The stream can be resynchronized at the next newline,
+    so nothing else is lost.)
+  - When a write to the editor fails (stdout closed), the editor is gone: tau-acp logs it, stops
+    reading, closes its sessions and exits 0. It is never reported as a serve that exited.
 
 ### A turn (`session/prompt`)
 

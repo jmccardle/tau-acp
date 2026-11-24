@@ -22,6 +22,11 @@ RESOURCE_NOT_FOUND = -32002
 Params = dict[str, Any]
 
 
+class EditorGone(Exception):
+    """The peer's end of the stream is closed: nothing more can be sent to it. (It is not a
+    ``ConnectionError``: that means a ``tau serve`` went away.)"""
+
+
 class RpcError(Exception):
     """A JSON-RPC error: raised by a handler to answer with it, or by ``request`` when the
     peer answered a request with one."""
@@ -52,6 +57,9 @@ RequestHandler = Callable[[str, Params], Awaitable[Any]]
 NotificationHandler = Callable[[str, Params], Awaitable[None]]
 
 
+TOO_LONG = b"line too long"
+
+
 def log(text: str) -> None:
     """Log to stderr: stdout carries only protocol messages."""
     print(f"tau-acp: {text}", file=sys.stderr, flush=True)
@@ -75,14 +83,39 @@ class Connection:
         self._pending: dict[int, asyncio.Future[Any]] = {}
         self._tasks: set[asyncio.Task[None]] = set()
         self._next_id = 0
+        self._gone = False
 
     async def run(self) -> None:
-        """Read messages until the peer closes the stream, then end every task still running."""
+        """Read messages until the peer closes the stream (or it can no longer be written to),
+        then end every task still running.
+
+        A line longer than the reader's limit is discarded through its end, answered with
+        ``-32700`` (id null), and reading goes on with the next line."""
         try:
-            while line := await self._reader.readline():
-                await self._line(line)
+            while (line := await self._next_line()) is not None:
+                if line is TOO_LONG:
+                    await self._error(None, RpcError(PARSE_ERROR, "Parse error: line too long"))
+                else:
+                    await self._line(line)
         finally:
             await self._shutdown()
+
+    async def _next_line(self) -> bytes | None:
+        """The next line, ``TOO_LONG`` for one over the limit, None at the end of the stream."""
+        too_long = False
+        while True:
+            try:
+                line = await self._reader.readuntil(b"\n")
+            except asyncio.IncompleteReadError as end:  # the end of the stream
+                return None if not end.partial or too_long else end.partial
+            except ConnectionError as error:  # the transport was lost under the reader
+                log(f"the stream broke: {type(error).__name__}: {error}")
+                return None
+            except asyncio.LimitOverrunError as over:
+                await self._reader.readexactly(over.consumed)  # discard what is over the limit
+                too_long = True
+                continue
+            return TOO_LONG if too_long else line
 
     async def request(self, method: str, params: Params) -> Any:
         """Send a request and wait for its response; ``RpcError`` if the peer answered with one."""
@@ -103,15 +136,22 @@ class Connection:
     async def _send(self, message: dict[str, Any]) -> None:
         data = json.dumps(message, ensure_ascii=False).encode() + b"\n"
         async with self._write_lock:
-            self._writer.write(data)
-            await self._writer.drain()
+            try:
+                self._writer.write(data)
+                await self._writer.drain()
+            except (ConnectionError, RuntimeError) as error:  # a closed pipe or transport
+                if not self._gone:
+                    self._gone = True
+                    log(f"the editor is gone ({type(error).__name__}: {error}): shutting down")
+                self._reader.feed_eof()  # stop reading: nobody is there to answer
+                raise EditorGone(str(error)) from None
 
     async def _line(self, line: bytes) -> None:
         if not line.strip():
             return
         try:
             message = json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError):  # not JSON, or nested too deep to read
             await self._error(None, RpcError(PARSE_ERROR, "Parse error"))
             return
         if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
@@ -138,8 +178,7 @@ class Connection:
         if future is None or future.done():
             log(f"response to no pending request: id {message['id']!r}")
         elif "error" in message:
-            error = message["error"]
-            future.set_exception(RpcError(error["code"], error["message"], error.get("data")))
+            future.set_exception(_error_of(message["error"]))
         else:
             future.set_result(message.get("result"))
 
@@ -148,26 +187,45 @@ class Connection:
             if not isinstance(method, str) or not isinstance(params, dict):
                 raise RpcError(INVALID_REQUEST, "Invalid request")
             outcome = await self._on_request(method, params)
+        except EditorGone:
+            return  # run() has noticed, and is shutting down
         except RpcError as error:
-            await self._error(ident, error)
+            await self._try_error(ident, error)
             return
         except Exception as error:  # the peer must get an answer
             log(f"{method}: {error!r}")
-            await self._error(ident, RpcError(INTERNAL_ERROR, f"{type(error).__name__}: {error}"))
+            await self._try_error(
+                ident, RpcError(INTERNAL_ERROR, f"{type(error).__name__}: {error}")
+            )
             return
         reply = outcome if isinstance(outcome, Reply) else Reply(outcome)
-        await self._send({"jsonrpc": "2.0", "id": ident, "result": reply.result})
-        if reply.after is not None:
-            try:
-                await reply.after()
-            except Exception as error:  # the response is already out
-                log(f"{method}: after the response: {error!r}")
+        try:
+            await self._send({"jsonrpc": "2.0", "id": ident, "result": reply.result})
+            if reply.after is not None:
+                await self._after(method, reply.after)
+        except EditorGone:
+            return
+
+    @staticmethod
+    async def _after(method: str, after: Callable[[], Awaitable[None]]) -> None:
+        try:
+            await after()
+        except EditorGone:
+            raise
+        except Exception as error:  # the response is already out
+            log(f"{method}: after the response: {error!r}")
+
+    async def _try_error(self, ident: Any, error: RpcError) -> None:
+        with contextlib.suppress(EditorGone):  # no one to tell
+            await self._error(ident, error)
 
     async def _notification(self, method: Any, params: Any) -> None:
         if not isinstance(method, str) or not isinstance(params, dict):
             return
         try:
             await self._on_notification(method, params)
+        except EditorGone:
+            pass  # run() has noticed, and is shutting down
         except Exception as error:  # a notification has no one to tell
             log(f"{method}: {error!r}")
 
@@ -184,3 +242,16 @@ class Connection:
         await asyncio.gather(*tasks, return_exceptions=True)
         with contextlib.suppress(Exception):
             self._writer.close()
+
+
+def _error_of(error: Any) -> RpcError:
+    """The ``RpcError`` for the ``error`` member of a response. A member that is not
+    ``{code: int, message: str}`` is not trusted: the request fails with ``-32603`` saying so."""
+    if (
+        isinstance(error, dict)
+        and isinstance(error.get("code"), int)
+        and isinstance(error.get("message"), str)
+    ):
+        return RpcError(error["code"], error["message"], error.get("data"))
+    log(f"malformed error in a response: {error!r}")
+    return RpcError(INTERNAL_ERROR, f"the peer answered with a malformed error: {error!r}")
