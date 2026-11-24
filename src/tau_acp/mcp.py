@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from tau_acp import __version__
+from tau_acp.child import Child, close_all, signal_all, tied
 from tau_acp.jsonrpc import INVALID_PARAMS, METHOD_NOT_FOUND, TOO_LONG, RpcError, log, read_line
 
 PROTOCOL_VERSION = "2025-11-25"
@@ -109,6 +110,7 @@ class McpClient:
     def __init__(self, name: str, process: asyncio.subprocess.Process) -> None:
         self.name = name
         self._process = process
+        self._child = Child(process)
         self._pending: dict[int, asyncio.Future[Any]] = {}
         self._next_id = 0
         self._exited = False
@@ -128,6 +130,7 @@ class McpClient:
                 stdout=asyncio.subprocess.PIPE,
                 limit=READ_LIMIT,
                 start_new_session=True,  # its own process group, signalled whole when it stops
+                preexec_fn=tied(),
             )
         except OSError as error:
             raise McpStartError(
@@ -270,25 +273,28 @@ class McpClient:
             future.set_exception(McpMalformed(f"returned a malformed result: {result!r:.80}"))
 
     async def stop(self) -> None:
-        """Close its stdin, wait, SIGTERM, wait, SIGKILL; the signals go to its whole process
-        group, so what it started goes too (also when it exited by itself)."""
+        """Close its stdin, wait, SIGTERM, wait, SIGKILL. The signals go to its whole process
+        group while it runs; what was in the group when the stop began also gets SIGTERM after
+        it exits. A server that exited before the stop began is not signalled at all, nor is
+        anything it left: its pid and group id may name someone else's processes by now."""
         process = self._process
-        if process.returncode is None:
-            assert process.stdin is not None
-            with contextlib.suppress(ConnectionError, RuntimeError):
-                process.stdin.close()
-            if not await self._exits():
-                self._signal(signal.SIGTERM)
+        group = self._child.group()
+        try:
+            if process.returncode is None:
+                assert process.stdin is not None
+                with contextlib.suppress(ConnectionError, RuntimeError):
+                    process.stdin.close()
                 if not await self._exits():
-                    self._signal(signal.SIGKILL)
-                    await process.wait()
-        self._signal(signal.SIGTERM)  # what is left of the group
+                    self._child.send_group(signal.SIGTERM)
+                    if not await self._exits():
+                        self._child.send_group(signal.SIGKILL)
+                        await process.wait()
+            signal_all(group, signal.SIGTERM)  # what is left of the group
+        finally:
+            close_all(group)
+            self._child.close()
         self._reader.cancel()
         await asyncio.gather(self._reader, return_exceptions=True)
-
-    def _signal(self, number: signal.Signals) -> None:
-        with contextlib.suppress(ProcessLookupError):  # nothing of the group is left
-            os.killpg(self._process.pid, number)
 
     async def _exits(self) -> bool:
         try:

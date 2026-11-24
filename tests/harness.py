@@ -63,9 +63,13 @@ class Env:
         return self.home / "rt"
 
     def serve_records(self) -> list[dict[str, Any]]:
-        """The records of the serves running in this home."""
-        records = (self.home / "serve").glob("*.json")
-        return [json.loads(path.read_text()) for path in sorted(records)]
+        """The records of the serves running in this home (a serve that is exiting may remove its
+        record while they are read: it is left out)."""
+        found = []
+        for path in sorted((self.home / "serve").glob("*.json")):
+            with contextlib.suppress(FileNotFoundError):
+                found.append(json.loads(path.read_text()))
+        return found
 
     def kill_serves(self) -> None:
         """Kill every serve of this home by its recorded pid, and nothing else."""

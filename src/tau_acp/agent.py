@@ -122,6 +122,7 @@ class Agent:
                 with held.alive():
                     await held.replay()
             return Reply(await _opened(held, {}), held.announce_commands)
+        await _exact(wanted)
         session = await self._start(cwd, wanted, list(servers.values()))
         try:
             await self._check_cwd(session, wanted, cwd)
@@ -222,34 +223,32 @@ class Agent:
         if relay is not None and relay.has_tools:
             args, environ = [*relay.serve_args, *args], relay.environ
         try:
-            record = await serve.start(cwd, args, wanted, environ)
+            running = await serve.start(cwd, args, wanted, environ)
         except serve.ServeError as error:
             code = RESOURCE_NOT_FOUND if error.kind == "UnknownSession" else -32603
             data = {"sessionId": wanted} if code == RESOURCE_NOT_FOUND else None
             raise RpcError(code, str(error), data) from None
         try:
-            _check_record(record, wanted)
+            _check_record(running.record, wanted)
             assert self.conn is not None
-            return await Session.attach(self.conn, record)
+            return await Session.attach(self.conn, running)
         except BaseException:
-            if record.started:  # not ours otherwise: another process serves it
-                await _stop(record)
+            await _stop(running)
             raise
 
     async def _release(self, session: Session) -> None:
-        """Disconnect, stop the serve if it is still ours, then the MCP servers and the relay
-        directory. Each step is tried whatever the others did; a failure is logged."""
+        """Disconnect, stop the serve, then the MCP servers and the relay directory. Each step is
+        tried whatever the others did; a failure is logged."""
         try:
             await session.close()
-            await _stop(session.record)
+            await _stop(session.serve)
         finally:
             if session.relay is not None:
                 await session.relay.stop()
 
 
 def _check_record(record: serve.ServeRecord, wanted: str | None) -> None:
-    """``RpcError`` unless the serve ``tau serve`` started or found is the session asked for,
-    and is ours."""
+    """``RpcError`` unless the serve ``tau serve`` started is the session asked for."""
     if wanted is not None and record.session != wanted:
         # τ takes an id prefix or a name for --session: the editor's key is the full id only.
         raise RpcError(
@@ -258,11 +257,18 @@ def _check_record(record: serve.ServeRecord, wanted: str | None) -> None:
             f"(τ resolved it to {record.session})",
             {"sessionId": wanted},
         )
-    if not record.started:
+
+
+async def _exact(wanted: str) -> None:
+    """``RpcError`` unless ``wanted`` is the full id of a session. τ also takes a name or an id
+    prefix for ``--session``, but the editor's key for a session is its full id only."""
+    found = await catalog.resolve(wanted)
+    if found != wanted:
+        named = "" if found is None else f" (τ resolves it to {found})"
         raise RpcError(
-            -32603,
-            f"session {record.session} is already served by pid {record.pid}: "
-            f"stop it with `tau serve --stop --session {record.session}`",
+            RESOURCE_NOT_FOUND,
+            f"no session {wanted}: tau-acp opens sessions by their full id{named}",
+            {"sessionId": wanted},
         )
 
 
@@ -273,11 +279,11 @@ async def _opened(session: Session, result: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-async def _stop(record: serve.ServeRecord) -> None:
+async def _stop(running: serve.Serve) -> None:
     try:
-        await serve.stop(record)
-    except Exception as error:  # the session is closed all the same: say what is left
-        log(f"session {record.session}: {error}")
+        await running.stop()
+    except Exception as error:  # the session is closed all the same: say what happened
+        log(f"session {running.record.session}: {error}")
 
 
 def _string(params: Params, key: str) -> str:

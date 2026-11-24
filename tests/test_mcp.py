@@ -1,5 +1,7 @@
 import asyncio
 import json
+import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -7,6 +9,7 @@ from pathlib import Path
 import pytest
 from acp import RequestError
 
+from tau_acp.mcp import McpClient, McpSpec
 from tests.harness import (
     SCRIPTED,
     Raw,
@@ -391,3 +394,36 @@ async def test_an_mcp_servers_whole_process_group_is_stopped(env):
         await conn.close_session(session_id=session.session_id)
         await until(lambda: gone(mcp_pid(env)), "the server to stop")
         await until(lambda: gone(child), "its child to stop")
+
+
+EXITS_AFTER_LISTING = """
+import json, os, sys
+open(sys.argv[1], "w").write(str(os.getpid()))
+for line in sys.stdin:
+    message = json.loads(line)
+    result = {"initialize": {"capabilities": {"tools": {}}}, "tools/list": {"tools": []}}
+    if message.get("method") in result:
+        print(json.dumps({"jsonrpc": "2.0", "id": message["id"],
+                          "result": result[message["method"]]}), flush=True)
+        if message["method"] == "tools/list":
+            sys.exit(0)
+"""
+
+
+@scripted
+async def test_a_server_that_exited_by_itself_is_never_signalled(tmp_path, monkeypatch):
+    """Its pid (and its process group id) may name someone else's processes by the time the
+    server is stopped: the stop signals nothing."""
+    script, pid_file = tmp_path / "server.py", tmp_path / "pid"
+    script.write_text(EXITS_AFTER_LISTING)
+    spec = McpSpec("early", sys.executable, [str(script), str(pid_file)], {})
+    client = await McpClient.start(spec, tmp_path)
+    assert await client.tools() == []  # and it exits, as a crashing server would
+    pid = int(pid_file.read_text())
+    await until(lambda: gone(pid), "the server to exit and be reaped")
+    sent = []
+    monkeypatch.setattr(os, "killpg", lambda *a: sent.append(("killpg", *a)))
+    monkeypatch.setattr(os, "kill", lambda *a: sent.append(("kill", *a)))
+    monkeypatch.setattr(signal, "pidfd_send_signal", lambda *a: sent.append(("pidfd", *a)))
+    await client.stop()
+    assert sent == []

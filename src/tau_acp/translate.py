@@ -44,6 +44,8 @@ def _fence(text: str) -> str:
 
 
 def _block_text(block: Mapping[str, Any]) -> str:
+    if not isinstance(block, Mapping):
+        raise ValueError(f"a prompt content block must be an object, not {block!r:.40}")
     kind = block.get("type")
     if kind == "text":
         return str(block["text"])

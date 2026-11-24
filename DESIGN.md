@@ -42,35 +42,49 @@ editor ──stdio (ACP JSON-RPC)──> tau-acp ──Unix socket (τ wire, Rem
                                   └──stdio (MCP JSON-RPC)──> each editor-requested MCP server
 ```
 
-- **Each ACP session is one `tau serve` process:**
-  - `python -m tau serve -d --json -e <path of tau_acp/_extension.py> [user serve args]`;
+- **Each ACP session is one `tau serve` process, tau-acp's child:**
+  - `python -m tau serve --json [--session ID] -e <path of tau_acp/_extension.py> [user serve
+    args]`, in the foreground (not `-d`), in its own session (`start_new_session`), stdin
+    `/dev/null`, stderr shared with tau-acp's (the editor's log);
   - its `cwd` is the session's `cwd` (a new session) or comes from τ's session record (a loaded
     session);
-  - tau-acp reads the one-line JSON record from stdout and connects with
-    `tau.RemoteClient.connect(record["socket"], "tau-acp")`.
+  - tau-acp reads the first line of its stdout, the JSON record (or τ's `{"error": ...}`, and
+    then it exits), checks that the record's pid is the child's, and connects with
+    `tau.RemoteClient.connect(record["socket"], "tau-acp")`. Whatever it prints later is read
+    and logged, so a full pipe never blocks it.
 - **Stopping:** tau-acp stops the serve when the session closes, or when the editor closes
-  stdin or tau-acp is signalled (`tau serve --stop --session ID --json`). The session log stays on
-  disk, so `session/load` can come back to it. (Exception, found in A1: τ discards a session that
-  never received input when its serve stops, so a `session/new` closed before its first prompt
-  cannot be loaded.)
-  - **Only a serve that is still ours is stopped.** First tau-acp reads the session's record
-    file (`$TAU_HOME/serve/<id>.json`): if it is gone, nothing is running; if it names another
-    pid, another serve holds the session now (a dead session that was started again by someone
-    else), it is left running, and the reason is logged. Only a record naming our pid is passed to
-    `--stop`, which itself checks the pid over the socket. tau-acp never signals a pid itself: a
-    pid can be reused. A serve that does not stop within 5 seconds is logged and left.
+  stdin or tau-acp is signalled. The session log stays on disk, so `session/load` can come back
+  to it. (Exception, found in A1: τ discards a session that never received input when its serve
+  stops, so a `session/new` closed before its first prompt cannot be loaded.)
+  - **A serve is stopped by signalling our own child, never a pid read back.** tau-acp holds a
+    pidfd for each child it starts (`tau_acp/child.py`), opened when it starts, and sends SIGTERM
+    through it; τ aborts what runs, winds down (up to 3 s), removes its record and socket, and
+    exits. A serve that has not exited 5 s after SIGTERM gets SIGKILL, and the release logs it (τ
+    replaces the stale record and socket it leaves the next time the session is served). A
+    child that has exited is never signalled: once reaped, its pid may be someone else's. On a
+    platform without pidfds (anywhere but Linux) the signal goes to the pid while asyncio has
+    not seen it exit.
   - **A session that is dead** (its serve exited, or its stream was cut off) is released the same
-    way: the check above is what tells a stale record from a successor.
-  - **Going away during `session/new` or `session/load`** (stdin closes, a signal) lets the
-    `tau serve -d` that is starting finish, then stops the serve it started, so none is orphaned.
-    A serve that was already running (`started` false) is never stopped.
+    way. Its successor, if someone else served the session meanwhile, is another process
+    and is never signalled: tau-acp only ever signals its own children.
+  - **Going away during `session/new` or `session/load`** (stdin closes, a signal) lets the start
+    that is under way finish, then stops the serve it started, so none is orphaned.
   - **`session/close` and shutdown always release everything:** if the serve is already gone
     and the abort fails, that is logged, and the MCP servers and the relay directory are still
     released. Shutdown releases the sessions together, and one session's failure does not
     skip another's.
-- **`record["started"] == false`** means another process already serves the session. tau-acp
-  replies with an error that names the pid and `tau serve --stop --session ID`. It never attaches,
-  and never stops it.
+  - **Signals:** SIGTERM, SIGINT and SIGHUP (the terminal closed) each start the shutdown. From
+    the moment the shutdown starts (a signal, or stdin closing), those three are ignored, so
+    a second Ctrl-C can neither cancel the shutdown nor kill tau-acp before it is done. The
+    exit status is 0. Children get the default actions back before they exec.
+  - **SIGKILL (Linux):** each child is started with `PR_SET_PDEATHSIG` = SIGTERM, so when
+    tau-acp dies without stopping it, the kernel sends the serve (and each MCP server) the
+    SIGTERM tau-acp would have sent. **Elsewhere there is no such tie: a SIGKILLed tau-acp leaves
+    its serves running** (an MCP server, whose stdin then closes, is expected to exit).
+- **A session another process serves or holds** (another editor, a TUI) is refused by τ itself:
+  the foreground serve fails with τ's `Leased` error ("session ID is in use by another process;
+  to work on a copy of it: tau --fork ID"), which tau-acp passes on as `-32603`. tau-acp never
+  attaches to a serve it did not start, and never stops one.
 - **User serve args:** everything after `--` on tau-acp's command line goes to every
   `tau serve`. Examples: `--set 'permissions.ask=["bash"]'`, or `-e` for more extensions. The
   editor's agent configuration is where a user puts them.
@@ -132,7 +146,13 @@ editor ──stdio (ACP JSON-RPC)──> tau-acp ──Unix socket (τ wire, Rem
   - "MCP server <name> exited" is said only when the process's stream really ended.
 - **Lifetime:** the servers live as long as the ACP session. They are stopped (stdin closed,
   then SIGTERM, then SIGKILL after a grace period) on session close or bridge exit. Each runs in
-  its own process group, and the signals go to the group, so what the server started stops with it.
+  its own process group. The signals go to the whole group while the server runs; when the
+  stop begins, tau-acp also takes pidfds for the other members of the group (from `/proc`), and
+  those still running get SIGTERM once the server has exited. So what the server started stops
+  with it, also when the server exits as soon as its stdin closes. A server that exited before the
+  stop began (it crashed) is not signalled, and neither is anything it left: its pid and group id
+  may name someone else's processes by then. Processes the server starts while it is being
+  stopped are not in the snapshot. Off Linux there is no `/proc` snapshot.
 - **Server names** must be unique within one request (`-32602`).
 - **`http`/`sse` entries:** these get a `-32602` error ("tau-acp supports stdio MCP servers only"). tau-acp advertises
   `mcpCapabilities: {http: false, sse: false}`.
@@ -145,7 +165,7 @@ editor ──stdio (ACP JSON-RPC)──> tau-acp ──Unix socket (τ wire, Rem
 | `session/new` | A1 (MCP in A2) | starts the MCP servers, then the serve; connects; reads the snapshot until `Labels`. Uses the lowest open cursor (a new session has cursor 0), calls `watch([cursor])` and sends `available_commands_update`. Returns `sessionId` = τ's session id, and `configOptions`. |
 | `session/prompt` | A1 | see "A turn" |
 | `session/cancel` | A1 | `abort(cursor)`; the pending prompt answers `cancelled` |
-| `session/load` | A1 | starts the serve with `--session ID`, then replays the history ("Replay") before answering. An unknown id gets `-32002`, and so does anything but a session's full id: τ's `--session` also takes an id prefix or a name, but then the serve's session is not the key the editor used, so the serve (if tau-acp started it) is stopped and the answer is `-32002` with `data.sessionId`. A `cwd` that differs from τ's record gets `-32602` (checked once the serve is up, because the record is only known then; a serve started for the check is stopped). A session this connection already holds is replayed, not restarted, if its `mcpServers` are the same (name, command, args, env); if they differ the answer is `-32602` ("session X is already open with different MCP servers; close it first"), because keeping the old tools silently would be wrong. A held session whose serve died is released and started again. Results carry `configOptions`. |
+| `session/load` | A1 | starts the serve with `--session ID`, then replays the history ("Replay") before answering. An unknown id gets `-32002`, and so does anything but a session's full id: τ's `--session` also takes an id prefix or a name, but then the serve's session is not the key the editor used. The id is resolved with `tau.find_session` before anything starts, and anything but an exact id is answered `-32002` with `data.sessionId` (naming the session τ would have opened, if any). The record's session is checked again once the serve is up. A `cwd` that differs from τ's record gets `-32602` (checked once the serve is up, because the record is only known then; a serve started for the check is stopped). A session this connection already holds is replayed, not restarted, if its `mcpServers` are the same (name, command, args, env); if they differ the answer is `-32602` ("session X is already open with different MCP servers; close it first"), because keeping the old tools silently would be wrong. A held session whose serve died is released and started again. Results carry `configOptions`. |
 | `session/list` | A3 | `tau.list_sessions($TAU_HOME/sessions, cwd=…)`. Each session is `{sessionId, cwd, title?, updatedAt}`: `title` is τ's name, else the first message cut to one line of at most 80 characters, else omitted; `updatedAt` is the log's modification time, ISO 8601 UTC. `cwd` (when given) must be an absolute directory and filters exactly. No paging: no `nextCursor`, and any `cursor` that is not null gets `-32602` ("tau-acp does not page session/list"). A directory that is not a readable session (τ gives it an `error`) is left out, because ACP requires a `cwd` and the editor could not load it; each one is logged to stderr, so it is never silent. τ has no public function for `TAU_HOME`, so tau-acp reads `$TAU_HOME` (a leading `~` is `$HOME`, relative is an error), else `~/.tau`, as τ documents. |
 | `session/resume` | A3 | the same as load, without the replay. It still sends `available_commands_update` and returns `configOptions`. |
 | `session/close` | A3 | cancels the prompt in flight (which answers `cancelled`), then stops the serve, the MCP servers and the relay directory. `{}` for an unknown or already closed session. |
@@ -163,7 +183,8 @@ editor ──stdio (ACP JSON-RPC)──> tau-acp ──Unix socket (τ wire, Rem
     reading goes on with the next line. (The stream can be resynchronized at the next newline,
     so nothing else is lost.)
   - When a write to the editor fails (stdout closed), the editor is gone: tau-acp logs it, stops
-    reading, closes its sessions and exits 0. It is never reported as a serve that exited.
+    reading, closes its sessions and exits 0. It is never reported as a serve that exited. This
+    holds also when the write that finds it gone is the answer to a malformed line.
 
 ### A turn (`session/prompt`)
 
@@ -286,8 +307,9 @@ The response comes only after the last notification.
     `session/cancel` or `session/close`.
 - **An MCP server dies mid-session:** its tools answer `{"err": "MCP server <name> exited"}`.
   τ records an `Err` result, and the model sees it. Nothing is restarted behind the user's back.
-- **The editor closes stdin, or sends SIGTERM/SIGINT:** every session is closed as for
-  `session/close`, then tau-acp exits 0.
+- **The editor closes stdin, or sends SIGTERM, SIGINT or SIGHUP:** every session is closed as
+  for `session/close`, then tau-acp exits 0. Further signals are ignored until it has (see
+  "Signals" above).
 
 ## Testing
 

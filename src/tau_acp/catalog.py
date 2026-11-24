@@ -57,3 +57,13 @@ def _rows(cwd: Path | None) -> list[dict[str, Any]]:
 async def list_sessions(cwd: Path | None) -> list[dict[str, Any]]:
     """The sessions of τ's catalog, newest first, those of ``cwd`` only when it is given."""
     return await asyncio.to_thread(_rows, cwd)
+
+
+async def resolve(session: str) -> str | None:
+    """The full id of the session τ's ``--session`` would open for ``session`` (an id, a name, a
+    unique id prefix or a path), or None when it names no session."""
+    try:
+        found = await asyncio.to_thread(tau.find_session, tau_home() / "sessions", session)
+    except tau.UnknownSession:
+        return None
+    return found.id

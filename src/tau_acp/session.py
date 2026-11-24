@@ -12,7 +12,7 @@ from tau_acp.follower import Editor, Follower
 from tau_acp.jsonrpc import INTERNAL_ERROR, INVALID_PARAMS, Connection, Params, RpcError, log
 from tau_acp.mcp import McpSpec
 from tau_acp.relay import Relay
-from tau_acp.serve import ServeRecord
+from tau_acp.serve import Serve
 
 CLIENT_ID = "tau-acp"
 DEATH_WAIT_SECONDS = 10.0  # for τ's stream to end after it aborted a turn: τ winds down in 3
@@ -24,14 +24,14 @@ class Session:
     def __init__(
         self,
         conn: Connection,
-        record: ServeRecord,
+        serve: Serve,
         client: Client,
         cursor: int,
         view: CursorView,
     ) -> None:
-        self.record = record
-        self.id = record.session
-        self.cwd = record.cwd
+        self.serve = serve  # the agent stops it
+        self.id = serve.record.session
+        self.cwd = serve.record.cwd
         self._conn = conn
         self._client = client
         self._cursor = cursor
@@ -45,9 +45,9 @@ class Session:
         self._idle.set()
 
     @classmethod
-    async def attach(cls, conn: Connection, record: ServeRecord) -> "Session":
+    async def attach(cls, conn: Connection, serve: Serve) -> "Session":
         """Connect to the serve, read its snapshot, take the lowest open cursor and watch it."""
-        client = await RemoteClient.connect(record.socket, CLIENT_ID)
+        client = await RemoteClient.connect(serve.record.socket, CLIENT_ID)
         try:
             views = await _snapshot(client)
             cursor = min(views)
@@ -55,7 +55,7 @@ class Session:
         except BaseException:
             await client.close()
             raise
-        session = cls(conn, record, client, cursor, views[cursor])
+        session = cls(conn, serve, client, cursor, views[cursor])
         session._follower.start()
         return session
 

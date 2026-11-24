@@ -8,10 +8,6 @@ import signal
 import sys
 from datetime import datetime
 
-import pytest
-
-from tau_acp import serve
-from tau_acp.serve import ServeError, ServeRecord
 from tests.harness import (
     SCRIPTED,
     Raw,
@@ -407,19 +403,6 @@ async def test_closing_a_dead_session_does_not_stop_the_serve_that_replaced_it(e
     finally:
         await raw.stop()
         env.kill_serves()
-
-
-@scripted
-async def test_stop_leaves_a_serve_whose_pid_is_not_the_recorded_one(env, monkeypatch):
-    monkeypatch.setenv("TAU_HOME", str(env.home))
-    monkeypatch.setenv("HOME", str(env.home))
-    async with agent(env) as (conn, _editor, _process):
-        session = await conn.new_session(cwd=str(env.work), mcp_servers=[])
-        pid = serve_pid(env, session.session_id)
-        record = ServeRecord("", pid + 1_000_000, session.session_id, str(env.work), True)
-        with pytest.raises(ServeError, match="left running"):
-            await serve.stop(record)
-        assert not gone(pid)
 
 
 # a session is opened by its full id only

@@ -1,9 +1,12 @@
 import asyncio
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
+
+import pytest
 
 from tau_acp.jsonrpc import Connection
 from tests.harness import SCRIPTED, Raw, gone, scripted, until
@@ -181,9 +184,9 @@ async def test_session_served_elsewhere_is_not_attached(env):
         _, response = await other.request("session/load", params)
         message = response["error"]["message"]
         assert response["error"]["code"] == -32603
-        assert str(pid) in message
-        assert f"tau serve --stop --session {session}" in message
+        assert f"session {session} is in use by another process" in message  # τ's own refusal
         assert not gone(pid)  # the first agent's serve was left alone
+        assert [r["pid"] for r in env.serve_records()] == [pid]  # and no second one is running
     finally:
         await agent.stop()
         await other.stop()
@@ -243,6 +246,63 @@ async def test_sigterm_stops_the_serves_too(env):
         agent.process.terminate()
         assert await asyncio.wait_for(agent.process.wait(), 60) == 0
         await until(lambda: gone(pid), "the serve to stop", 10)
+    finally:
+        await agent.stop()
+
+
+@pytest.mark.parametrize("number", [signal.SIGTERM, signal.SIGINT, signal.SIGHUP])
+@pytest.mark.parametrize("starting", [True, False], ids=["while-starting", "started"])
+@scripted
+async def test_a_second_signal_does_not_cancel_the_shutdown(env, number, starting):
+    """Ctrl-C twice (or a closed terminal's SIGHUP) still stops every serve, also one that is
+    starting when the first signal comes."""
+    agent = await Raw.start(env)
+    try:
+        await agent.request("initialize", {"protocolVersion": 1})
+        new = {"cwd": str(env.work), "mcpServers": []}
+        if starting:
+            await agent.write(request_for({"id": 9, "method": "session/new", "params": new}))
+            await until(lambda: list((env.home / "sessions").glob("*")), "the start to begin")
+        else:
+            await agent.request("session/new", new)
+        agent.process.send_signal(number)
+        await asyncio.sleep(0.05)
+        agent.process.send_signal(number)
+        assert await asyncio.wait_for(agent.process.wait(), 60) == 0
+        await until(lambda: env.serve_records() == [], "the serve to stop and remove its record")
+    finally:
+        await agent.stop()
+        env.kill_serves()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="PR_SET_PDEATHSIG is Linux's")
+@scripted
+async def test_a_killed_tau_acp_takes_its_serve_with_it(env):
+    agent = await Raw.start(env)
+    try:
+        await agent.request("initialize", {"protocolVersion": 1})
+        await agent.request("session/new", {"cwd": str(env.work), "mcpServers": []})
+        pid = env.serve_records()[0]["pid"]
+        agent.process.kill()  # SIGKILL: tau-acp cannot stop anything
+        await agent.process.wait()
+        await until(lambda: gone(pid), "the serve to get SIGTERM from the kernel", 10)
+        assert env.serve_records() == []  # it wound down as on any SIGTERM
+    finally:
+        await agent.stop()
+        env.kill_serves()
+
+
+@scripted
+async def test_a_non_object_prompt_block_is_invalid_params(env):
+    agent = await Raw.start(env)
+    try:
+        await agent.request("initialize", {"protocolVersion": 1})
+        _, response = await agent.request("session/new", {"cwd": str(env.work), "mcpServers": []})
+        session = response["result"]["sessionId"]
+        for block in ("hello", 7, None, ["text"]):
+            params = {"sessionId": session, "prompt": [block]}
+            _, response = await agent.request("session/prompt", params)
+            assert response["error"]["code"] == -32602, block
     finally:
         await agent.stop()
 
@@ -404,6 +464,34 @@ async def test_an_editor_that_stops_reading_ends_tau_acp_cleanly(env):
         assert "tau serve for session" not in error
         assert "the editor is gone" in error
         assert env.serve_records() == []  # its sessions are closed
+    finally:
+        process.kill()
+        process.wait()
+        for pipe in (process.stdin, process.stderr):
+            pipe.close()
+
+
+@scripted
+async def test_a_bad_line_to_an_editor_that_is_gone_exits_zero(env):
+    """Answering a malformed line is how tau-acp finds the editor gone: a clean exit, as when
+    any other write finds it."""
+    process = subprocess.Popen(
+        [sys.executable, "-m", "tau_acp"],
+        cwd=env.work,
+        env={**os.environ, **env.environ},
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        process.stdout.close()  # the editor stops reading
+        process.stdin.write(b"not json\n")
+        process.stdin.flush()
+        code = await asyncio.get_running_loop().run_in_executor(None, process.wait, 40)
+        error = process.stderr.read().decode()
+        assert code == 0, error
+        assert "Traceback" not in error
+        assert "the editor is gone" in error
     finally:
         process.kill()
         process.wait()

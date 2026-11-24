@@ -117,6 +117,8 @@ class Connection:
                     await self._error(None, RpcError(PARSE_ERROR, "Parse error: line too long"))
                 else:
                     await self._line(line)
+        except EditorGone:
+            pass  # answering a bad line found the editor gone: nothing more can be said to it
         finally:
             await self._shutdown()
 

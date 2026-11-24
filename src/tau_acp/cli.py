@@ -3,7 +3,6 @@
 import argparse
 import asyncio
 import os
-import signal
 import stat
 import sys
 from collections.abc import Sequence
@@ -11,6 +10,7 @@ from typing import BinaryIO
 
 from tau_acp import __version__
 from tau_acp.agent import Agent
+from tau_acp.child import STOP_SIGNALS, ignore_stop_signals
 from tau_acp.jsonrpc import Connection
 
 READ_LIMIT = 1 << 26  # a prompt may embed a whole file in one line
@@ -41,13 +41,21 @@ async def run_agent(serve_args: Sequence[str], out: BinaryIO) -> None:
     loop = asyncio.get_running_loop()
     main_task = asyncio.current_task()
     assert main_task is not None
-    for sig in (signal.SIGTERM, signal.SIGINT):  # an editor may stop us with a signal
-        loop.add_signal_handler(sig, main_task.cancel)
+
+    def stopping() -> None:
+        # Only the first signal stops us. A second one (Ctrl-C twice) must not cancel the
+        # shutdown that stops the serves and the MCP servers, nor kill us while it runs.
+        ignore_stop_signals()
+        main_task.cancel()
+
+    for sig in STOP_SIGNALS:  # an editor or a terminal may stop us with a signal
+        loop.add_signal_handler(sig, stopping)
     try:
         await agent.conn.run()
     except asyncio.CancelledError:
         pass  # a signal: the sessions are closed below, and that is a clean exit
     finally:
+        ignore_stop_signals()  # also when stdin closed: no signal cuts the shutdown short
         await agent.close()
 
 
