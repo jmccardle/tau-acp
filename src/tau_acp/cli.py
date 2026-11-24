@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import os
 import signal
+import stat
 import sys
 from collections.abc import Sequence
 from typing import BinaryIO
@@ -60,6 +61,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--version", action="version", version=f"tau-acp {__version__}")
     parser.parse_args(own)
+    for fd, name in ((0, "stdin"), (1, "stdout")):
+        if not stat.S_ISFIFO(mode := os.fstat(fd).st_mode) and not stat.S_ISSOCK(mode):
+            print(f"tau-acp: {name} must be a pipe or socket: an editor starts it", file=sys.stderr)
+            return 2
     # Stdout carries only protocol messages: keep a private copy of it for them, and point fd 1
     # at stderr so that a stray print, or a child that inherits it, cannot corrupt the stream.
     out = os.fdopen(os.dup(1), "wb", buffering=0)
