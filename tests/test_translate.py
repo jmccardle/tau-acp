@@ -1,7 +1,9 @@
 """The pure translation functions, on τ's public value types."""
 
+import json
+
 import pytest
-from tau import Author, Body, CursorView, Ending, Form, Outcome, Part, Stop
+from tau import Author, Body, CursorView, Ending, Form, OpenQuestion, Outcome, Part, Stop
 
 from tau_acp import translate
 
@@ -243,3 +245,75 @@ def test_an_unusable_last_stop_is_an_error():
         translate.stop_reason(view(Ending.Done()), None, message=True, cancelled=False)
     with pytest.raises(translate.TurnError, match="ended with"):
         translate.stop_reason(view(Ending.Done()), Stop.Error, message=True, cancelled=False)
+
+
+def question(text, id=0):
+    return OpenQuestion(id, None, "permissions", text, {"enum": ["yes", "always", "no"]})
+
+
+def asked(question_text, *calls, taken=None, cwd="/w"):
+    node = Node(4, Body.Assistant(list(calls), Stop.Tools), parent=3)
+    return translate.permission_tool_call(
+        question(question_text), node, set() if taken is None else taken, cwd
+    )
+
+
+def test_a_permission_question_is_matched_to_the_call_with_the_same_shown_text():
+    first = Part.Call("c1", "write", '{"path": "safe.txt"}')
+    second = Part.Call("c2", "write", '{"path": "secret.txt"}')
+    update = asked("write: /w/secret.txt\n(ask rule: write)", first, second)
+    assert update["toolCallId"] == "4:c2"
+    assert update["rawInput"] == {"path": "secret.txt"}
+    assert update["content"][0]["content"]["text"] == "write: /w/secret.txt\n(ask rule: write)"
+
+
+@pytest.mark.parametrize(
+    ("call", "shown"),
+    [
+        (Part.Call("c", "bash", '{"command": "ls -l"}'), "bash: ls -l"),
+        (Part.Call("c", "bash", '{"command": 3}'), 'bash: {"command": 3}'),
+        (Part.Call("c", "web", '{"q": "x"}'), 'web: {"q": "x"}'),
+        (Part.Call("c", "read", '{"path": "../a"}'), "read: /a"),
+        (Part.Call("c", "grep", '{"pattern": "x"}'), "grep: /w"),
+        (
+            Part.Call("c", "grep", '{"path": "a", "files": ["b", "c"]}'),
+            "grep: /w/a\ngrep: /w/b\ngrep: /w/c",
+        ),
+        (Part.Call("c", "read", '{"path": 4}'), 'read: {"path": 4}'),
+    ],
+)
+def test_shown_is_what_tau_builds_for_its_question(call, shown):
+    assert translate.shown(call.tool, call.args_raw, "/w") == shown
+    assert asked(f"{shown}\n(ask rule: x)", call)["toolCallId"] == "4:c"
+
+
+def test_identical_calls_are_taken_in_turn():
+    calls = [
+        Part.Call("c1", "bash", '{"command": "x"}'),
+        Part.Call("c2", "bash", '{"command": "x"}'),
+    ]
+    taken: set[str] = set()
+    ids = [asked("bash: x\n(ask rule: bash)", *calls, taken=taken)["toolCallId"] for _ in range(3)]
+    assert ids == ["4:c1", "4:c2", "question:0"]
+
+
+def test_a_question_that_matches_no_call_is_shown_whole():
+    update = asked("bash: rm -rf /\n(ask rule: bash)", Part.Call("c1", "bash", '{"command": "ls"}'))
+    assert update == {
+        "toolCallId": "question:0",
+        "title": "bash: rm -rf /\n(ask rule: bash)",
+        "content": [
+            {
+                "type": "content",
+                "content": {"type": "text", "text": "bash: rm -rf /\n(ask rule: bash)"},
+            }
+        ],
+    }
+
+
+def test_an_ambiguous_question_is_shown_whole():
+    """A command that contains τ's own marker makes two calls' texts prefixes of one another."""
+    plain = Part.Call("c1", "bash", '{"command": "x"}')
+    tricky = Part.Call("c2", "bash", json.dumps({"command": "x\n(ask rule: y)\nz"}))
+    update = asked("bash: x\n(ask rule: y)\nz\n(ask rule: bash)", plain, tricky)
+    assert update["toolCallId"] == "question:0"

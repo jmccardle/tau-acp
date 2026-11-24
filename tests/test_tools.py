@@ -153,3 +153,64 @@ async def test_cancel_during_a_tool(env):
         reply = await turn
         assert reply.stop_reason == "cancelled"
         assert editor.of("tool_call_update")[-1].status == "failed"
+
+
+# The permission question names no call: tau-acp must tie it to the call τ asks about.
+
+
+def batch(*calls: tuple[str, dict]) -> str:
+    return "\n".join(call(tool, **args) for tool, args in calls)
+
+
+@scripted
+async def test_permission_is_asked_about_the_call_that_asks(env):
+    """Two writes in one batch: the first is allowed by a rule, the second asks. The editor must be
+    shown the second (it used to be shown the first, and approved the wrong file)."""
+    serve = (
+        *("-e", SCRIPTED),
+        *("--set", 'permissions.allow=["write:*safe.txt"]'),
+        *("--set", 'permissions.ask=["write"]'),
+    )
+    async with agent(env, *serve, choice="reject_once") as (conn, editor, _process):
+        session = await conn.new_session(cwd=str(env.work), mcp_servers=[])
+        both = batch(
+            ("write", {"path": "safe.txt", "content": "ok"}),
+            ("write", {"path": "secret.txt", "content": "pwn"}),
+        )
+        await conn.prompt(session_id=session.session_id, prompt=[text(both)])
+        ((asked, _options),) = editor.permissions
+        assert asked.tool_call_id.endswith(":c2")
+        assert asked.raw_input["path"] == "secret.txt"
+        assert "secret.txt" in asked.title
+        assert f"write: {env.work / 'secret.txt'}" in asked.content[0].content.text
+        assert (env.work / "safe.txt").exists()
+        assert not (env.work / "secret.txt").exists()  # rejected
+
+
+@scripted
+async def test_identical_calls_are_asked_about_one_each(env):
+    async with agent(env, *ASK) as (conn, editor, _process):
+        session = await conn.new_session(cwd=str(env.work), mcp_servers=[])
+        twice = batch(("bash", {"command": "echo hi"}), ("bash", {"command": "echo hi"}))
+        await conn.prompt(session_id=session.session_id, prompt=[text(twice)])
+        assert len(editor.permissions) == 2
+        ids = [asked.tool_call_id for asked, _options in editor.permissions]
+        assert sorted(i.rsplit(":", 1)[1] for i in ids) == ["c1", "c2"]
+        assert all("bash: echo hi" in a.content[0].content.text for a, _o in editor.permissions)
+
+
+@scripted
+async def test_permission_shows_the_resolved_path_tau_asks_about(env):
+    """τ's question names the real path a symlink leads to: so does the request."""
+    serve = (*("-e", SCRIPTED), *("--set", 'permissions.ask=["write"]'))
+    async with agent(env, *serve, choice="reject_once") as (conn, editor, _process):
+        session = await conn.new_session(cwd=str(env.work), mcp_servers=[])
+        link = env.work / "link"
+        link.symlink_to(env.work / "real.txt")
+        await conn.prompt(
+            session_id=session.session_id,
+            prompt=[text(call("write", path="link", content="x"))],
+        )
+        ((asked, _options),) = editor.permissions
+        assert asked.tool_call_id.endswith(":c1")
+        assert f"write: {env.work / 'real.txt'}" in asked.content[0].content.text

@@ -280,22 +280,71 @@ def permission_answer(result: Any) -> str | None:
     return chosen if chosen in {option[0] for option in PERMISSION_OPTIONS} else None
 
 
+# What τ's permissions extension writes before "\n(ask rule: ...": `Call.shown` in τ's
+# `_permissions.py`. A question carries no call id, so the call it asks about is found by
+# building this text for every call of the batch and comparing.
+ASK_MARKER = "\n(ask rule: "
+SHOWN_PATH_TOOLS = ("read", "write", "edit", "grep", "find")
+
+
+def _named_paths(tool: str, args: Any) -> tuple[str, ...]:
+    """The paths a path tool's arguments name (τ's ``_paths``); none if they are not strings."""
+    if not isinstance(args, dict):
+        return ()
+    named: list[Any] = []
+    if "path" in args:
+        named.append(args["path"])
+    files = args.get("files") if tool == "grep" else None
+    if files is not None:
+        if not isinstance(files, list):
+            return ()
+        named.extend(files)
+    if not named and tool in ("grep", "find"):
+        named.append(".")
+    return tuple(named) if all(isinstance(n, str) for n in named) else ()
+
+
+def shown(tool: str, args_raw: str, cwd: str) -> str:
+    """The text τ's permissions question shows for a call: a line per resolved path for a path
+    tool, ``bash: <command>``, or ``<tool>: <args_raw>``."""
+    parsed = parse_args(args_raw)
+    args = parsed if isinstance(parsed, dict) else {}
+    if tool in SHOWN_PATH_TOOLS and (paths := _named_paths(tool, args)):
+        return "\n".join(f"{tool}: {os.path.realpath(os.path.join(cwd, p))}" for p in paths)
+    command = args.get("command") if tool == "bash" else None
+    return f"{tool}: {command if isinstance(command, str) else args_raw}"
+
+
 def permission_tool_call(
     question: OpenQuestion, node: Node | None, taken: set[str], cwd: str
 ) -> Update:
-    """The tool call a permissions question is about: the first call in the Assistant node
-    ``node`` whose tool is the text before ``": "`` and that is not in ``taken`` (the ids of calls
-    asked about already; the match is added to it). Without one, a call made of the question."""
-    tool = question.text.split(": ", 1)[0]
+    """The tool call a permissions question is about, as the ``toolCall`` of a
+    ``session/request_permission``, always with the question's text as its content.
+
+    The call is the one in the Assistant node ``node`` whose ``shown`` text is the question's
+    (the question is that text, then ``(ask rule: ...)``) and whose id is not in ``taken`` (the
+    ids of calls asked about already; the match is added to it). Calls with the same text are
+    taken in turn. When none matches, or the question is a prefix of more than one different
+    text (a command can contain the marker), the call is not guessed: ``question:<id>`` with the
+    question's text as title."""
+    said = [{"type": "content", "content": {"type": "text", "text": question.text}}]
     if node is not None and isinstance(node.body, Body.Assistant):
-        for part in node.body.parts:
-            identity = call_id(node.id, part.id) if isinstance(part, Part.Call) else None
-            if identity and part.tool == tool and identity not in taken:
-                taken.add(identity)
-                update = tool_call(node.id, part, cwd)
-                del update["sessionUpdate"], update["status"]
-                return update
-    return {"toolCallId": f"question:{question.id}", "title": question.text}
+        found = [
+            (part, text)
+            for part in node.body.parts
+            if isinstance(part, Part.Call)
+            and call_id(node.id, part.id) not in taken
+            and question.text.startswith(
+                (text := shown(part.tool, part.args_raw, cwd)) + ASK_MARKER
+            )
+        ]
+        if found and len({text for _part, text in found}) == 1:
+            part = found[0][0]
+            taken.add(call_id(node.id, part.id))
+            update = tool_call(node.id, part, cwd)
+            del update["sessionUpdate"], update["status"]
+            return {**update, "content": said}
+    return {"toolCallId": f"question:{question.id}", "title": question.text, "content": said}
 
 
 # Stop reasons

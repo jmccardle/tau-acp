@@ -190,9 +190,17 @@ editor ──stdio (ACP JSON-RPC)──> tau-acp ──Unix socket (τ wire, Rem
 - **Permissions questions** (extension `permissions`, enum `yes|always|no`) send
   `session/request_permission`, with options `allow_once`/`yes`, `allow_always`/`always` and
   `reject_once`/`no`. It runs as a task, so events keep flowing.
-  - Its `toolCall.toolCallId` is the call in the Assistant node at `view.at` whose tool name
-    matches the text before `": "`. The first such call without an answer wins.
-  - If none matches, it is `"question:<id>"`, with the question text as the title.
+  - τ's question carries no call id, so tau-acp finds the call by the question's text. τ writes
+    `<shown>\n(ask rule: ...)`, where `<shown>` is a line `<tool>: <resolved absolute path>` per
+    path for a path tool (`read write edit grep find`; paths resolved against the session cwd
+    with symlinks followed, as τ does), `bash: <command>`, or `<tool>: <args_raw>` for any
+    other. tau-acp builds that text for every call in the Assistant node at `view.at`. The
+    `toolCall.toolCallId` is the call whose text the question starts with, among calls not
+    asked about yet; calls with identical text are taken in turn.
+  - Nothing is guessed. If no call matches, or the question could be about two calls with
+    different texts, it is `"question:<id>"` with the question text as the title.
+  - **Either way the question's text is the `content` of the `toolCall`**, so the editor shows
+    exactly what τ asks, whatever the match.
   - The answer goes to `answer(id, value)`. `cancelled`, an error response or an unknown option
     is answered with `None` (decline).
 - **Any other question** is declined (`answer(id, None)`), and an `agent_message_chunk` says so:
