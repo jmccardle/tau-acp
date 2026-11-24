@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ffwf-tau-acp"
+dynamic = ["version"]  # single-sourced: src/tau_acp/__init__.py
+description = "Bridge between editors speaking the Agent Client Protocol and a τ session"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = [
+    # Deliberately pinned to one τ minor series: τ's wire protocol number must
+    # match exactly between client and server, so a τ bump needs a tau-acp release.
+    "ffwf-tau>=0.16,<0.17",
+]
+
+[project.scripts]
+tau-acp = "tau_acp.cli:main"
+
+[dependency-groups]
+dev = ["pytest", "ruff"]
+
+[tool.hatch.version]
+path = "src/tau_acp/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tau_acp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = [".venv*"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "C90", "PL", "PT", "TID", "SLF"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["tau_acp"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 15
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["PLR2004"]
