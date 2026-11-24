@@ -63,11 +63,16 @@ editor ──stdio (ACP JSON-RPC)──> tau-acp ──Unix socket (τ wire, Rem
 
 ### The extension and the relay (MCP tools inside τ)
 
+- **The extension is loaded only when there is something to relay.** With no MCP servers, or
+  servers that list no tools, tau-acp passes neither `-e` nor `TAU_ACP_RELAY`: τ's tool set is
+  then exactly what it is without tau-acp.
 - **The extension is never an entry point.** An installed `tau.extensions` entry point would
   load into every τ session in the environment. τ loads `tau_acp/_extension.py` only because
   tau-acp names it with `-e PATH`.
 - **Startup handoff:**
-  - before starting the serve, tau-acp makes a private directory (mode 700) holding
+  - before starting the serve, tau-acp makes a private directory (mode 700, under
+    `$XDG_RUNTIME_DIR` or the temporary directory, with a short name for the socket path limit)
+    holding
     `tools.json`, the MCP tools it has collected, and `relay.sock`, which tau-acp listens on;
   - it passes the directory in the environment as `TAU_ACP_RELAY`;
   - the extension reads `tools.json` **at import**. This is necessary, because τ reads an
@@ -96,11 +101,13 @@ editor ──stdio (ACP JSON-RPC)──> tau-acp ──Unix socket (τ wire, Rem
     tau-acp's environment), in the session's `cwd`.
 - **Handshake:** the 2025-11-25 `initialize` handshake, then `notifications/initialized`, then
   `tools/list`, following `nextCursor` until it is exhausted.
-- **Failures:** any failure (spawn, handshake, list) ends the ACP request with an error naming
-  the server. `env` values never appear in errors or logs.
+- **Failures:** any failure (spawn, handshake, list, a 60-second timeout of either) ends the ACP
+  request with `-32603` and an error naming the server. Servers already started are stopped.
+  `tools/list` is only sent when the server declared `capabilities.tools`. `env` values never appear in errors or logs.
 - **Lifetime:** the servers live as long as the ACP session. They are stopped (stdin closed,
   then SIGTERM, then SIGKILL after a grace period) on session close or bridge exit.
-- **`http`/`sse` entries:** these get a `-32602` error. tau-acp advertises
+- **Server names** must be unique within one request (`-32602`).
+- **`http`/`sse` entries:** these get a `-32602` error ("tau-acp supports stdio MCP servers only"). tau-acp advertises
   `mcpCapabilities: {http: false, sse: false}`.
 
 ## ACP methods

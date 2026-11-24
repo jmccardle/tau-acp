@@ -8,7 +8,7 @@ translates between the two. [DESIGN.md](DESIGN.md) is the contract.
 Everything runs on one machine: tau-acp, the `tau serve` processes it starts, and the files
 being edited.
 
-## Status: phase A1
+## Status: phase A2
 
 Works now:
 
@@ -23,11 +23,18 @@ Works now:
   typed. An unknown `/word` goes to the model as text.
 - Closing stdin (or SIGTERM) stops every `tau serve` it started and exits 0.
 
-Not yet: MCP servers (`session/new` and `session/load` refuse a non-empty `mcpServers` list
-until phase A2), `session/list`, `session/resume`, `session/close` and the model option (A3).
+- MCP servers, stdio only: the `mcpServers` of `session/new` and `session/load` are started
+  (in the session's directory, without a shell) before `tau serve`, and their tools reach the
+  model as `mcp__<server>__<tool>`, through a small τ extension tau-acp loads with `-e`. They
+  show in the editor like any τ tool and ask permission the same way. Results are text: an
+  image or other non-text block becomes a line saying it was omitted. A server that cannot
+  start fails `session/new` with an error naming it; one that exits mid-session fails its
+  tool calls. `http`/`sse` entries are refused.
+
+Not yet: `session/list`, `session/resume`, `session/close` and the model option (A3).
 
 Not planned: `fs/*` and `terminal/*` client methods (τ's own tools work on the local files),
-`http`/`sse` MCP servers, image and audio prompts, and any network transport.
+`http`/`sse` MCP servers (MCP is stdio only), image and audio prompts, and any network transport.
 
 ## Setup
 

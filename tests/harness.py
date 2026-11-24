@@ -21,6 +21,8 @@ from acp import Client
 from acp.schema import (
     AllowedOutcome,
     DeniedOutcome,
+    EnvVariable,
+    McpServerStdio,
     PermissionOption,
     RequestPermissionResponse,
     TextContentBlock,
@@ -30,6 +32,7 @@ from acp.stdio import spawn_agent_process
 
 TIMEOUT = 90.0
 SCRIPTED = str(Path(__file__).with_name("scripted.py"))
+MCP_SERVER = str(Path(__file__).with_name("mcp_server.py"))
 
 
 @dataclass
@@ -47,7 +50,16 @@ class Env:
 
     @property
     def environ(self) -> dict[str, str]:
-        return {"TAU_HOME": str(self.home), "HOME": str(self.home)}
+        return {
+            "TAU_HOME": str(self.home),
+            "HOME": str(self.home),
+            "XDG_RUNTIME_DIR": str(self.runtime),
+        }
+
+    @property
+    def runtime(self) -> Path:
+        """Where tau-acp makes its relay directories: empty again once a session is closed."""
+        return self.home / "rt"
 
     def serve_records(self) -> list[dict[str, Any]]:
         """The records of the serves running in this home."""
@@ -67,6 +79,7 @@ def env() -> Iterator[Env]:
     work = home / "w"
     work.mkdir()
     env = Env(home, work)
+    env.runtime.mkdir()
     env.configure()
     try:
         yield env
@@ -223,3 +236,25 @@ class Raw:
         if self.process.returncode is None:
             self.process.kill()
             await self.process.wait()
+
+
+def mcp_server(env: Env, name: str = "test", **variables: str) -> McpServerStdio:
+    """The stdio entry for ``tests/mcp_server.py``; it logs to ``env.home/<name>.log``."""
+    variables = {"MCP_LOG": str(env.home / f"{name}.log"), **variables}
+    return McpServerStdio(
+        name=name,
+        command=sys.executable,
+        args=[MCP_SERVER],
+        env=[EnvVariable(name=k, value=v) for k, v in variables.items()],
+    )
+
+
+def mcp_log(env: Env, name: str = "test") -> list[dict[str, Any]]:
+    """What the test MCP server logged: its start, and every message it received."""
+    path = env.home / f"{name}.log"
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
+def mcp_pid(env: Env, name: str = "test") -> int:
+    """The pid the test MCP server logged at its start."""
+    return next(e["started"] for e in mcp_log(env, name) if "started" in e)

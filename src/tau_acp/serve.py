@@ -10,7 +10,7 @@ import json
 import os
 import signal
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -40,10 +40,13 @@ def _command(*args: str) -> list[str]:
     return [sys.executable, "-m", "tau", "serve", *args]
 
 
-async def _run(args: Sequence[str], cwd: Path | None = None) -> tuple[int, str, str]:
+async def _run(
+    args: Sequence[str], cwd: Path | None = None, env: Mapping[str, str] | None = None
+) -> tuple[int, str, str]:
     process = await asyncio.create_subprocess_exec(
         *_command(*args),
         cwd=cwd,
+        env={**os.environ, **env} if env else None,
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -66,12 +69,18 @@ def _json_line(out: str, err: str, code: int) -> dict:
     return record
 
 
-async def start(cwd: Path, serve_args: Sequence[str], session: str | None = None) -> ServeRecord:
-    """Start (or find) the serve for a new session, or for the existing session ``session``."""
+async def start(
+    cwd: Path,
+    serve_args: Sequence[str],
+    session: str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> ServeRecord:
+    """Start (or find) the serve for a new session, or for the existing session ``session``.
+    ``env`` is added to tau-acp's environment for it."""
     args = ["-d", "--json"]
     if session is not None:
         args += ["--session", session]
-    code, out, err = await _run([*args, *serve_args], cwd)
+    code, out, err = await _run([*args, *serve_args], cwd, env)
     record = _json_line(out, err, code)
     return ServeRecord(
         socket=record["socket"],

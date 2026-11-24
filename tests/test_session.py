@@ -4,7 +4,6 @@ from acp.schema import (
     EmbeddedResourceContentBlock,
     ImageContentBlock,
     Implementation,
-    McpServerStdio,
     ResourceContentBlock,
     TextResourceContents,
 )
@@ -114,16 +113,6 @@ async def test_unknown_session_prompt(env):
         with pytest.raises(RequestError) as caught:
             await conn.prompt(session_id="nope", prompt=[text("hi")])
         assert caught.value.code == -32002
-
-
-@scripted
-async def test_mcp_servers_wait_for_a2(env):
-    server = McpServerStdio(name="s", command="/bin/true", args=[], env=[])
-    async with agent(env) as (conn, _editor, _process):
-        with pytest.raises(RequestError) as caught:
-            await conn.new_session(cwd=str(env.work), mcp_servers=[server])
-        assert caught.value.code == -32602
-        assert env.serve_records() == []  # nothing was started
 
 
 @scripted

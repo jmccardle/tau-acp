@@ -17,6 +17,8 @@ from tau_acp.jsonrpc import (
     RpcError,
     log,
 )
+from tau_acp.mcp import McpSpec, parse_servers
+from tau_acp.relay import Relay
 from tau_acp.session import Session
 
 PROTOCOL_VERSION = 1
@@ -78,16 +80,15 @@ class Agent:
 
     async def _new(self, params: Params) -> Reply:
         cwd = _cwd(params)
-        _no_mcp(params)
-        session = await self._start(cwd, None)
+        session = await self._start(cwd, None, parse_servers(params.get("mcpServers")))
         return Reply({"sessionId": session.id}, session.announce_commands)
 
     async def _load(self, params: Params) -> Reply:
         cwd = _cwd(params)
-        _no_mcp(params)
+        servers = parse_servers(params.get("mcpServers"))
         wanted = _string(params, "sessionId")
         held = self._sessions.get(wanted)  # already held: replay it, do not restart its serve
-        session = held or await self._start(cwd, wanted)
+        session = held or await self._start(cwd, wanted, servers)
         if Path(session.cwd) != cwd:
             if held is None:
                 await self._release(self._sessions.pop(session.id))
@@ -117,10 +118,26 @@ class Agent:
             raise RpcError(RESOURCE_NOT_FOUND, f"no session {ident}", {"sessionId": ident})
         return session
 
-    async def _start(self, cwd: Path, wanted: str | None) -> Session:
-        """Start the serve for a new session, or for session ``wanted``, and attach to it."""
+    async def _start(self, cwd: Path, wanted: str | None, servers: list[McpSpec]) -> Session:
+        """Start the MCP servers, then the serve for a new session (or session ``wanted``), and
+        attach to it. Nothing is left running when this raises."""
+        relay = await Relay.start(servers, cwd) if servers else None
         try:
-            record = await serve.start(cwd, self._serve_args, wanted)
+            session = await self._start_serve(cwd, wanted, relay)
+        except BaseException:
+            if relay is not None:
+                await relay.stop()
+            raise
+        session.relay = relay
+        self._sessions[session.id] = session
+        return session
+
+    async def _start_serve(self, cwd: Path, wanted: str | None, relay: Relay | None) -> Session:
+        # The extension is loaded only when there are MCP tools: with none, τ's tool set is
+        # exactly what it is without tau-acp.
+        args = [*relay.serve_args, *self._serve_args] if relay else self._serve_args
+        try:
+            record = await serve.start(cwd, args, wanted, relay.environ if relay else None)
         except serve.ServeError as error:
             code = RESOURCE_NOT_FOUND if error.kind == "UnknownSession" else -32603
             data = {"sessionId": wanted} if code == RESOURCE_NOT_FOUND else None
@@ -133,16 +150,16 @@ class Agent:
             )
         assert self.conn is not None
         try:
-            session = await Session.attach(self.conn, record)
+            return await Session.attach(self.conn, record)
         except BaseException:
             await _stop(record)
             raise
-        self._sessions[session.id] = session
-        return session
 
     async def _release(self, session: Session) -> None:
         await session.close()
         await _stop(session.record)
+        if session.relay is not None:
+            await session.relay.stop()
 
 
 async def _stop(record: serve.ServeRecord) -> None:
@@ -164,12 +181,3 @@ def _cwd(params: Params) -> Path:
     if not cwd.is_absolute() or not cwd.is_dir():
         raise RpcError(INVALID_PARAMS, f"cwd must be an existing absolute directory: {cwd}")
     return Path(os.path.normpath(cwd))
-
-
-def _no_mcp(params: Params) -> None:
-    servers = params.get("mcpServers")
-    if not isinstance(servers, list):
-        raise RpcError(INVALID_PARAMS, "mcpServers must be an array")
-    if servers:
-        # TODO(A2): start the stdio MCP servers and relay their tools; until then, say so.
-        raise RpcError(INVALID_PARAMS, "MCP servers arrive in phase A2")

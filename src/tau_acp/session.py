@@ -7,6 +7,7 @@ from tau import Client, CursorGone, CursorView, Labels, RemoteClient
 
 from tau_acp import translate
 from tau_acp.jsonrpc import INVALID_PARAMS, Connection, Params, RpcError
+from tau_acp.relay import Relay
 from tau_acp.serve import ServeRecord
 from tau_acp.turn import Editor, Turn
 
@@ -32,6 +33,7 @@ class Session:
         self._cursor = cursor
         self._view = view
         self._turn: Turn | None = None
+        self.relay: Relay | None = None  # set by the agent, which stops it
 
     @classmethod
     async def attach(cls, conn: Connection, record: ServeRecord) -> "Session":
