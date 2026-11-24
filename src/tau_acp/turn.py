@@ -32,6 +32,7 @@ from tau_acp.jsonrpc import INTERNAL_ERROR, INVALID_PARAMS, Params, RpcError, lo
 
 Emit = Callable[[translate.Update], Awaitable[None]]
 Ask = Callable[[Params], Awaitable[Any]]
+ModelChanged = Callable[[str | None], Awaitable[None]]
 PERMISSIONS = "permissions"
 PERMISSION_VALUES = ["yes", "always", "no"]
 
@@ -44,6 +45,7 @@ class Editor:
     cwd: str
     emit: Emit
     ask: Ask
+    model_changed: ModelChanged
 
 
 class Turn:
@@ -57,6 +59,7 @@ class Turn:
         self._cwd = editor.cwd
         self._emit = editor.emit
         self._ask = editor.ask
+        self._model_changed = editor.model_changed
         self._stepped = False
         self._last_stop: Stop | None = None
         self._text = ""
@@ -114,19 +117,34 @@ class Turn:
         if self.view.busy:
             await self._rest()  # loading the command woke the cursor
         self._stepped = False
-        call = asyncio.ensure_future(parsed.run(self._client, self._cursor))
-        try:
-            await self._hear_until(call)
-        except BaseException:
-            call.cancel()
-            raise
-        result = call.result()
+        result = await self._invoke(parsed.run(self._client, self._cursor))
         view = await self._rest() if self.view.busy else self.view
         if result:
             await self._emit(translate.chunk("agent_message_chunk", result))
         if not self._stepped:
             return "cancelled" if self.cancelled else "end_turn"
         return translate.stop_reason(view, self._last_stop, message=False, cancelled=self.cancelled)
+
+    async def set_model(self, name: str) -> None:
+        """Run τ's ``model`` command, hearing events meanwhile; ``RpcError`` if τ refuses."""
+        if self.view.busy:
+            await self._rest()
+        try:
+            await self._invoke(self._client.run(self._cursor, "model", {"model": name}))
+        except (ValueError, LookupError) as error:
+            raise RpcError(INVALID_PARAMS, str(error)) from None
+        if self.view.busy:
+            await self._rest()
+
+    async def _invoke(self, coroutine: Coroutine[Any, Any, Any]) -> Any:
+        """Run a client call as a task while events keep being heard; its result."""
+        call = asyncio.ensure_future(coroutine)
+        try:
+            await self._hear_until(call)
+        except BaseException:
+            call.cancel()
+            raise
+        return call.result()
 
     # Hearing events
 
@@ -167,7 +185,10 @@ class Turn:
 
     async def _hear(self, event: Event) -> None:
         if isinstance(event, CursorView):
+            before = self.view.model
             self._view(event)
+            if event.cursor == self._cursor and event.model != before:
+                await self._model_changed(event.model)
         elif isinstance(event, Live) and event.cursor == self._cursor:
             await self._live(event.delta)
         elif isinstance(event, Appended):

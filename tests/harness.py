@@ -43,9 +43,10 @@ class Env:
     work: Path
 
     def configure(self, **options: Any) -> None:
-        """Write τ's config: the mock model ``m``, with these provider options."""
+        """Write τ's config: the mock models ``m`` (the default) and ``m2``, with these provider
+        options."""
         model = {"model": "m", "provider": "mock", "options": {"delay_ms": 0, **options}}
-        config = {"default_model": "m", "models": {"m": model}}
+        config = {"default_model": "m", "models": {"m": model, "m2": {**model, "model": "m2"}}}
         (self.home / "config.json").write_text(json.dumps(config))
 
     @property

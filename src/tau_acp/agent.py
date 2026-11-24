@@ -5,8 +5,9 @@ from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Any
 
-from tau_acp import __version__, serve, translate
+from tau_acp import __version__, catalog, serve, translate
 from tau_acp.jsonrpc import (
+    INTERNAL_ERROR,
     INVALID_PARAMS,
     INVALID_REQUEST,
     METHOD_NOT_FOUND,
@@ -26,6 +27,7 @@ CAPABILITIES = {
     "loadSession": True,
     "promptCapabilities": {"image": False, "audio": False, "embeddedContext": True},
     "mcpCapabilities": {"http": False, "sse": False},
+    "sessionCapabilities": {"list": {}, "resume": {}, "close": {}},
 }
 
 
@@ -41,6 +43,10 @@ class Agent:
             "initialize": self._initialize,
             "session/new": self._new,
             "session/load": self._load,
+            "session/resume": self._resume,
+            "session/list": self._list,
+            "session/close": self._close,
+            "session/set_config_option": self._set_config_option,
             "session/prompt": self._prompt,
         }
 
@@ -81,22 +87,63 @@ class Agent:
     async def _new(self, params: Params) -> Reply:
         cwd = _cwd(params)
         session = await self._start(cwd, None, parse_servers(params.get("mcpServers")))
-        return Reply({"sessionId": session.id}, session.announce_commands)
+        return Reply(await _opened(session, {"sessionId": session.id}), session.announce_commands)
 
     async def _load(self, params: Params) -> Reply:
+        return await self._reopen(params, replay=True)
+
+    async def _resume(self, params: Params) -> Reply:
+        return await self._reopen(params, replay=False)
+
+    async def _reopen(self, params: Params, *, replay: bool) -> Reply:
+        """``session/load`` and ``session/resume``: they differ only in the replay."""
         cwd = _cwd(params)
-        servers = parse_servers(params.get("mcpServers"))
+        servers = {spec.name: spec for spec in parse_servers(params.get("mcpServers"))}
         wanted = _string(params, "sessionId")
-        held = self._sessions.get(wanted)  # already held: replay it, do not restart its serve
-        session = held or await self._start(cwd, wanted, servers)
+        held = self._sessions.get(wanted)
+        if held is not None and held.dead is not None:
+            await self._release(self._sessions.pop(wanted))  # its serve is gone: start it again
+            held = None
+        if held is not None and held.servers != servers:
+            raise RpcError(
+                INVALID_PARAMS,
+                f"session {wanted} is already open with different MCP servers; close it first",
+            )
+        session = held or await self._start(cwd, wanted, list(servers.values()))
         if Path(session.cwd) != cwd:
             if held is None:
                 await self._release(self._sessions.pop(session.id))
             raise RpcError(
                 INVALID_PARAMS, f"session {wanted} was started in {session.cwd}, not in {cwd}"
             )
-        await session.replay()
-        return Reply({}, session.announce_commands)
+        if replay:
+            with session.alive():
+                await session.replay()
+        return Reply(await _opened(session, {}), session.announce_commands)
+
+    async def _list(self, params: Params) -> dict[str, Any]:
+        if params.get("cursor") is not None:
+            raise RpcError(INVALID_PARAMS, "tau-acp does not page session/list")
+        cwd = _cwd(params) if params.get("cwd") is not None else None
+        return {"sessions": await catalog.list_sessions(cwd)}
+
+    async def _close(self, params: Params) -> dict[str, Any]:
+        session = self._sessions.pop(_string(params, "sessionId"), None)
+        if session is not None:
+            await session.cancel_and_wait()  # the prompt in flight answers `cancelled`
+            await self._release(session)
+        return {}
+
+    async def _set_config_option(self, params: Params) -> dict[str, Any]:
+        session = self._session(params)
+        if params.get("type", "select") != "select":
+            raise RpcError(INVALID_PARAMS, "tau-acp has select config options only")
+        if params.get("configId") != "model":
+            raise RpcError(INVALID_PARAMS, f"unknown config option {params.get('configId')!r}")
+        value = params.get("value")
+        if not isinstance(value, str):
+            raise RpcError(INVALID_PARAMS, "value must be a string")
+        return {"configOptions": await session.set_model(value)}
 
     async def _prompt(self, params: Params) -> dict[str, str]:
         session = self._session(params)
@@ -116,6 +163,8 @@ class Agent:
         session = self._sessions.get(ident)
         if session is None:
             raise RpcError(RESOURCE_NOT_FOUND, f"no session {ident}", {"sessionId": ident})
+        if session.dead is not None:
+            raise RpcError(INTERNAL_ERROR, session.dead)
         return session
 
     async def _start(self, cwd: Path, wanted: str | None, servers: list[McpSpec]) -> Session:
@@ -129,6 +178,7 @@ class Agent:
                 await relay.stop()
             raise
         session.relay = relay
+        session.servers = {spec.name: spec for spec in servers}
         self._sessions[session.id] = session
         return session
 
@@ -160,6 +210,13 @@ class Agent:
         await _stop(session.record)
         if session.relay is not None:
             await session.relay.stop()
+
+
+async def _opened(session: Session, result: dict[str, Any]) -> dict[str, Any]:
+    """``result`` with the session's ``configOptions``, when it has any."""
+    if options := await session.config_options():
+        result["configOptions"] = options
+    return result
 
 
 async def _stop(record: serve.ServeRecord) -> None:

@@ -30,7 +30,7 @@ async def test_initialize_on_the_wire(env):
             "embeddedContext": True,
         }
         assert caps["mcpCapabilities"] == {"http": False, "sse": False}
-        assert "sessionCapabilities" not in caps  # arrives in A3
+        assert caps["sessionCapabilities"] == {"list": {}, "resume": {}, "close": {}}
     finally:
         await agent.stop()
 
@@ -82,7 +82,7 @@ async def test_load_replays_before_it_responds(env):
         await second.request("initialize", {"protocolVersion": 1})
         params = {"sessionId": session, "cwd": str(env.work), "mcpServers": []}
         before, response = await second.request("session/load", params)
-        assert response["result"] == {}
+        assert list(response["result"]) == ["configOptions"]
         updates = [m["params"]["update"] for m in before]
         assert all(m["method"] == "session/update" for m in before)
         assert [u["sessionUpdate"] for u in updates] == [

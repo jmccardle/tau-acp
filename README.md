@@ -8,12 +8,17 @@ translates between the two. [DESIGN.md](DESIGN.md) is the contract.
 Everything runs on one machine: tau-acp, the `tau serve` processes it starts, and the files
 being edited.
 
-## Status: phase A2
+## Status: phase A3
 
 Works now:
 
 - `initialize`, `session/new`, `session/prompt`, `session/cancel`, `session/load` (with replay
-  of the conversation).
+  of the conversation), `session/resume` (without it), `session/list` (a project's sessions,
+  titled by name or first message, newest first, no paging) and `session/close`.
+- A `model` config option, a select of τ's configured models: change it with
+  `session/set_config_option`, or with `/model NAME` in a prompt (the editor is told).
+- A `tau serve` that dies fails the pending prompt with an error naming the session; the session
+  stays dead until `session/load` or `session/resume` starts it again.
 - Streamed replies and thinking, tool calls with their results and live output, and τ's
   notices.
 - Tool permissions: when τ asks (for example with a `permissions.ask` rule), the editor gets a
@@ -31,10 +36,16 @@ Works now:
   start fails `session/new` with an error naming it; one that exits mid-session fails its
   tool calls. `http`/`sse` entries are refused.
 
-Not yet: `session/list`, `session/resume`, `session/close` and the model option (A3).
+Limits, by decision:
 
-Not planned: `fs/*` and `terminal/*` client methods (τ's own tools work on the local files),
-`http`/`sse` MCP servers (MCP is stdio only), image and audio prompts, and any network transport.
+- MCP servers are stdio only (`http`/`sse` are refused).
+- No `fs/*` or `terminal/*` client methods: τ's own tools work on the local files.
+- No image or audio prompts.
+- Unstable ACP methods (`session/fork` and others) are not supported.
+- Local only: tau-acp, its `tau serve` processes and the files are on one machine, and there is
+  no network transport. A session some other process serves is never attached to.
+- `session/load` or `resume` of a session this connection already holds, with different
+  `mcpServers`, is refused: close it first.
 
 ## Setup
 

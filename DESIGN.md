@@ -114,15 +114,15 @@ editor ──stdio (ACP JSON-RPC)──> tau-acp ──Unix socket (τ wire, Rem
 
 | method | phase | behaviour |
 |---|---|---|
-| `initialize` | A1 | answers `protocolVersion: 1` (it echoes 1; for any other version it still answers 1), `agentCapabilities {loadSession: true, promptCapabilities {image: false, audio: false, embeddedContext: true}, mcpCapabilities {http: false, sse: false}, sessionCapabilities {list: {}, resume: {}, close: {}}}`, `authMethods: []` and `agentInfo {name: "tau-acp", version}`. `sessionCapabilities` is added in A3. |
-| `session/new` | A1 (MCP in A2) | starts the MCP servers, then the serve; connects; reads the snapshot until `Labels`. Uses the lowest open cursor (a new session has cursor 0), calls `watch([cursor])` and sends `available_commands_update`. Returns `sessionId` = τ's session id, and `configOptions` (A3). |
+| `initialize` | A1 | answers `protocolVersion: 1` (it echoes 1; for any other version it still answers 1), `agentCapabilities {loadSession: true, promptCapabilities {image: false, audio: false, embeddedContext: true}, mcpCapabilities {http: false, sse: false}, sessionCapabilities {list: {}, resume: {}, close: {}}}`, `authMethods: []` and `agentInfo {name: "tau-acp", version}`. |
+| `session/new` | A1 (MCP in A2) | starts the MCP servers, then the serve; connects; reads the snapshot until `Labels`. Uses the lowest open cursor (a new session has cursor 0), calls `watch([cursor])` and sends `available_commands_update`. Returns `sessionId` = τ's session id, and `configOptions`. |
 | `session/prompt` | A1 | see "A turn" |
 | `session/cancel` | A1 | `abort(cursor)`; the pending prompt answers `cancelled` |
-| `session/load` | A1 | starts the serve with `--session ID`, then replays the history ("Replay") before answering. An unknown id gets `-32002`. A `cwd` that differs from τ's record gets `-32602` (checked once the serve is up, because the record is only known then; a serve started for the check is stopped). A session this connection already holds is replayed, not restarted. |
-| `session/list` | A3 | `tau.list_sessions($TAU_HOME/sessions, cwd=…)` gives `{sessionId, cwd, title: name or first message, updatedAt}`, with no paging (no `nextCursor`) |
-| `session/resume` | A3 | the same as load, without the replay |
-| `session/close` | A3 | cancels, then stops the serve and the MCP servers; `{}` even for an unknown session |
-| `session/set_config_option` | A3 | a single `model` select option, `category: "model"`, whose values come from `complete(cursor, "model", "")`. Setting it runs τ's `model` command. |
+| `session/load` | A1 | starts the serve with `--session ID`, then replays the history ("Replay") before answering. An unknown id gets `-32002`. A `cwd` that differs from τ's record gets `-32602` (checked once the serve is up, because the record is only known then; a serve started for the check is stopped). A session this connection already holds is replayed, not restarted, if its `mcpServers` are the same (name, command, args, env); if they differ the answer is `-32602` ("session X is already open with different MCP servers; close it first"), because keeping the old tools silently would be wrong. A held session whose serve died is released and started again. Results carry `configOptions`. |
+| `session/list` | A3 | `tau.list_sessions($TAU_HOME/sessions, cwd=…)`. Each session is `{sessionId, cwd, title?, updatedAt}`: `title` is τ's name, else the first message cut to one line of at most 80 characters, else omitted; `updatedAt` is the log's modification time, ISO 8601 UTC. `cwd` (when given) must be an absolute directory and filters exactly. No paging: no `nextCursor`, and any `cursor` that is not null gets `-32602` ("tau-acp does not page session/list"). A directory that is not a readable session (τ gives it an `error`) is left out, because ACP requires a `cwd` and the editor could not load it; each one is logged to stderr, so it is never silent. τ has no public function for `TAU_HOME`, so tau-acp reads `$TAU_HOME` (a leading `~` is `$HOME`, relative is an error), else `~/.tau`, as τ documents. |
+| `session/resume` | A3 | the same as load, without the replay. It still sends `available_commands_update` and returns `configOptions`. |
+| `session/close` | A3 | cancels the prompt in flight (which answers `cancelled`), then stops the serve, the MCP servers and the relay directory. `{}` for an unknown or already closed session. |
+| `session/set_config_option` | A3 | the one option, `model`: a `select`, `category: "model"`, `currentValue` = `CursorView.model`, options from `complete(cursor, "model", "")` (each `value` and `name` is τ's model name; if the current model is not among them it is added first, since it is a real value). An unknown `configId`, a non-select `type`, or a value that is not an option gets `-32602`. Otherwise τ's `model` command runs (as a task while events are read) and the answer is the full `configOptions`. A model change that comes from τ's side (a `/model` in a prompt) sends `config_option_update` with the full set; one the editor asked for does not (the answer carries it). If τ names no model (`CursorView.model` is `None`), `configOptions` is left out of the results and the option is not offered. |
 
 - Unknown methods get `-32601`. Unknown notifications are ignored. Any request before
   `initialize` gets `-32600`.
@@ -217,8 +217,16 @@ The response comes only after the last notification.
 
 - **The serve exits, or the socket drops** (`ConnectionError` from the client):
   - a pending prompt gets `-32603` ("tau serve for session X exited: …");
-  - the session is marked dead, and later requests on it get the same error;
-  - a fresh `session/load` starts it again.
+  - the session is marked dead, and later requests on it (`session/prompt`,
+    `session/set_config_option`) get the same error;
+  - `session/load` or `session/resume` releases the dead entry and starts the serve again (with
+    the request's `mcpServers`); `session/close` releases it. Until then its MCP servers and
+    relay directory stay, like any session's.
+  - A serve told to stop (SIGTERM) first aborts its cursor, so a turn can end `Aborted` when
+    the editor did not cancel. Nothing else is attached, so tau-acp waits up to 2 seconds
+    for the serve to exit: if it does, that is the error above, and if not it is `-32603`
+    ("tau serve aborted the turn … on its own"). A cancel is `cancelled` only after
+    `session/cancel` or `session/close`.
 - **An MCP server dies mid-session:** its tools answer `{"err": "MCP server <name> exited"}`.
   τ records an `Err` result, and the model sees it. Nothing is restarted behind the user's back.
 - **The editor closes stdin, or sends SIGTERM/SIGINT:** every session is closed as for
@@ -253,4 +261,4 @@ The response comes only after the last notification.
   - tool naming, result conversion, cancellation;
   - `-32602` for http/sse.
 - **A3 — the rest of the stable methods:** `session/list`, `session/resume`, `session/close`,
-  the model config option, and failure handling (serve death, MCP death).
+  the model config option, and failure handling (serve death; MCP death was done in A2).
