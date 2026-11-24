@@ -5,8 +5,13 @@ import asyncio
 import json
 import os
 import signal
+import sys
 from datetime import datetime
 
+import pytest
+
+from tau_acp import serve
+from tau_acp.serve import ServeError, ServeRecord
 from tests.harness import (
     SCRIPTED,
     Raw,
@@ -360,5 +365,195 @@ async def test_load_of_a_held_session_checks_its_mcp_servers(env):
         assert mcp_pid(env) == pid
         assert len([e for e in mcp_log(env) if "started" in e]) == 1
         await raw.request("session/close", {"sessionId": session})
+    finally:
+        await raw.stop()
+
+
+# releasing a session: only what is ours, whatever the state of the serve
+
+
+async def other_serve(env, session: str) -> int:
+    """Start a serve for ``session`` outside tau-acp (as another editor or a user might)."""
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        *("-m", "tau", "serve", "-d", "--json", "--session", session),
+        cwd=env.work,
+        env={**os.environ, **env.environ},
+        stdout=asyncio.subprocess.PIPE,
+    )
+    out, _ = await process.communicate()
+    return json.loads(out.splitlines()[-1])["pid"]
+
+
+@scripted
+async def test_closing_a_dead_session_does_not_stop_the_serve_that_replaced_it(env):
+    raw = await start(env)
+    try:
+        session = await new(raw, env)
+        await raw.request("session/prompt", prompt(session, "hi"))
+        pid = serve_pid(env, session)
+        os.kill(pid, signal.SIGTERM)
+        await until(lambda: gone(pid), "the serve to exit")
+        _, response = await raw.request("session/prompt", prompt(session, "x"))
+        assert "exited" in response["error"]["message"]  # tau-acp has found it dead
+        other = await other_serve(env, session)  # someone else serves the session now
+        assert other != pid
+        _, response = await raw.request("session/close", {"sessionId": session})
+        assert response["result"] == {}
+        await asyncio.sleep(1.5)  # a wrong stop is not instant
+        assert not gone(other)
+        assert await raw.eof() == 0
+        assert not gone(other)  # nor is it stopped when tau-acp exits
+    finally:
+        await raw.stop()
+        env.kill_serves()
+
+
+@scripted
+async def test_stop_leaves_a_serve_whose_pid_is_not_the_recorded_one(env, monkeypatch):
+    monkeypatch.setenv("TAU_HOME", str(env.home))
+    monkeypatch.setenv("HOME", str(env.home))
+    async with agent(env) as (conn, _editor, _process):
+        session = await conn.new_session(cwd=str(env.work), mcp_servers=[])
+        pid = serve_pid(env, session.session_id)
+        record = ServeRecord("", pid + 1_000_000, session.session_id, str(env.work), True)
+        with pytest.raises(ServeError, match="left running"):
+            await serve.stop(record)
+        assert not gone(pid)
+
+
+# a session is opened by its full id only
+
+
+@scripted
+async def test_load_by_a_prefix_or_name_is_refused_and_nothing_is_left_running(env):
+    raw = await start(env)
+    try:
+        session = await new(raw, env)
+        await raw.request("session/prompt", prompt(session, "hi"))
+        await raw.request("session/close", {"sessionId": session})
+        assert env.serve_records() == []
+        for method in ("session/load", "session/resume"):
+            params = {"sessionId": session[:-3], "cwd": str(env.work), "mcpServers": []}
+            _, response = await raw.request(method, params)
+            assert response["error"]["code"] == -32002, response
+            assert response["error"]["data"] == {"sessionId": session[:-3]}
+            assert session in response["error"]["message"]
+            assert env.serve_records() == []  # the serve it started for the check is stopped
+            _, response = await raw.request("session/prompt", prompt(session[:-3], "again"))
+            assert response["error"]["code"] == -32002
+        _, response = await raw.request(
+            "session/load", {"sessionId": session, "cwd": str(env.work), "mcpServers": []}
+        )
+        assert "result" in response
+    finally:
+        await raw.stop()
+
+
+@scripted
+async def test_load_by_a_prefix_of_a_held_session_does_not_stop_it(env):
+    raw = await start(env)
+    try:
+        session = await new(raw, env)
+        params = {"sessionId": session[:-3], "cwd": str(env.work), "mcpServers": []}
+        _, response = await raw.request("session/resume", params)
+        assert response["error"]["code"] == -32002
+        _, response = await raw.request("session/prompt", prompt(session, "still mine"))
+        assert response["result"] == {"stopReason": "end_turn"}
+    finally:
+        await raw.stop()
+
+
+# going away in the middle of starting
+
+
+@scripted
+async def test_eof_during_session_new_leaves_no_serve(env):
+    raw = await start(env)
+    try:
+        message = {"cwd": str(env.work), "mcpServers": []}
+        await raw.write(
+            json.dumps(
+                {"jsonrpc": "2.0", "id": 7, "method": "session/new", "params": message}
+            ).encode()
+        )
+        await asyncio.sleep(0.15)  # `tau serve -d` takes about a second
+        assert await raw.eof() == 0
+        await asyncio.sleep(5)  # long enough for the serve to have been started, and stopped
+        assert env.serve_records() == []
+    finally:
+        await raw.stop()
+
+
+@scripted
+async def test_eof_during_session_new_releases_the_mcp_servers(env):
+    raw = await start(env, "-e", SCRIPTED)
+    try:
+        servers = [mcp_server(env).model_dump(by_alias=True, exclude_none=True)]
+        message = {"cwd": str(env.work), "mcpServers": servers}
+        await raw.write(
+            json.dumps(
+                {"jsonrpc": "2.0", "id": 7, "method": "session/new", "params": message}
+            ).encode()
+        )
+        await until(lambda: mcp_log(env), "the MCP server to start")
+        assert await raw.eof() == 0
+        await until(lambda: gone(mcp_pid(env)), "the MCP server to stop")
+        await asyncio.sleep(5)
+        assert env.serve_records() == []
+        assert list(env.runtime.iterdir()) == []
+    finally:
+        await raw.stop()
+
+
+# closing when the serve dies under the close
+
+
+@scripted
+async def test_close_releases_everything_when_the_serve_dies_during_it(env):
+    raw = await start(env, "-e", SCRIPTED)
+    try:
+        session = await new(raw, env, [mcp_server(env)])
+        pid = serve_pid(env, session)
+        mcp = mcp_pid(env)
+        raw.last_id += 1
+        await raw.write(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": raw.last_id,
+                    "method": "session/prompt",
+                    "params": prompt(session, slow()),
+                }
+            ).encode()
+        )
+        await until(
+            lambda: any(e.get("params", {}).get("name") == "slow" for e in mcp_log(env)),
+            "the slow call to reach the MCP server",
+        )
+        os.kill(pid, signal.SIGSTOP)  # the abort that close sends gets no answer ...
+        closing = asyncio.ensure_future(raw.request("session/close", {"sessionId": session}))
+        await asyncio.sleep(0.5)
+        os.kill(pid, signal.SIGKILL)  # ... until the connection is lost
+        _, response = await closing
+        assert response["result"] == {}
+        await until(lambda: gone(mcp), "the MCP server to stop")
+        assert list(env.runtime.iterdir()) == []
+    finally:
+        await raw.stop()
+
+
+@scripted
+async def test_eof_releases_every_session(env):
+    raw = await start(env, "-e", SCRIPTED)
+    try:
+        for name in ("one", "two"):
+            await new(raw, env, [mcp_server(env, name)])
+        assert len(env.serve_records()) == 2
+        assert await raw.eof() == 0
+        assert env.serve_records() == []
+        assert list(env.runtime.iterdir()) == []
+        for name in ("one", "two"):
+            assert gone(mcp_pid(env, name))
     finally:
         await raw.stop()

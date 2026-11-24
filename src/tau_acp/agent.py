@@ -1,5 +1,6 @@
 """The ACP agent: the method handlers and the registry of sessions."""
 
+import asyncio
 import os
 from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
@@ -70,8 +71,13 @@ class Agent:
         """Close every session: disconnect, and stop its serve."""
         sessions = list(self._sessions.values())
         self._sessions.clear()
-        for session in sessions:
-            await self._release(session)
+        # Together, so that an editor's grace period before it kills us is spent once.
+        results = await asyncio.gather(
+            *(self._release(session) for session in sessions), return_exceptions=True
+        )
+        for session, result in zip(sessions, results, strict=True):
+            if isinstance(result, BaseException):
+                log(f"session {session.id}: releasing it failed: {result!r}")
 
     # Methods
 
@@ -87,7 +93,8 @@ class Agent:
     async def _new(self, params: Params) -> Reply:
         cwd = _cwd(params)
         session = await self._start(cwd, None, parse_servers(params.get("mcpServers")))
-        return Reply(await _opened(session, {"sessionId": session.id}), session.announce_commands)
+        result = await self._register(session, {"sessionId": session.id})
+        return Reply(result, session.announce_commands)
 
     async def _load(self, params: Params) -> Reply:
         return await self._reopen(params, replay=True)
@@ -109,17 +116,40 @@ class Agent:
                 INVALID_PARAMS,
                 f"session {wanted} is already open with different MCP servers; close it first",
             )
-        session = held or await self._start(cwd, wanted, list(servers.values()))
+        if held is not None:
+            await self._check_cwd(held, wanted, cwd)
+            if replay:
+                with held.alive():
+                    await held.replay()
+            return Reply(await _opened(held, {}), held.announce_commands)
+        session = await self._start(cwd, wanted, list(servers.values()))
+        try:
+            await self._check_cwd(session, wanted, cwd)
+            if replay:
+                with session.alive():
+                    await session.replay()
+        except BaseException:
+            await self._release(session)
+            raise
+        return Reply(await self._register(session, {}), session.announce_commands)
+
+    @staticmethod
+    async def _check_cwd(session: Session, wanted: str, cwd: Path) -> None:
         if Path(session.cwd) != cwd:
-            if held is None:
-                await self._release(self._sessions.pop(session.id))
             raise RpcError(
                 INVALID_PARAMS, f"session {wanted} was started in {session.cwd}, not in {cwd}"
             )
-        if replay:
-            with session.alive():
-                await session.replay()
-        return Reply(await _opened(session, {}), session.announce_commands)
+
+    async def _register(self, session: Session, result: dict[str, Any]) -> dict[str, Any]:
+        """Add the session's ``configOptions`` to ``result`` and hold the session. The session is
+        released when this raises: it is not held, so nothing else would."""
+        try:
+            result = await _opened(session, result)
+        except BaseException:
+            await self._release(session)
+            raise
+        self._sessions[session.id] = session
+        return result
 
     async def _list(self, params: Params) -> dict[str, Any]:
         if params.get("cursor") is not None:
@@ -130,8 +160,12 @@ class Agent:
     async def _close(self, params: Params) -> dict[str, Any]:
         session = self._sessions.pop(_string(params, "sessionId"), None)
         if session is not None:
-            await session.cancel_and_wait()  # the prompt in flight answers `cancelled`
-            await self._release(session)
+            try:
+                await session.cancel_and_wait()  # the prompt in flight answers `cancelled`
+            except Exception as error:  # the serve is gone: closing is what was asked
+                log(f"session {session.id}: closing: {error!r}")
+            finally:
+                await self._release(session)
         return {}
 
     async def _set_config_option(self, params: Params) -> dict[str, Any]:
@@ -169,7 +203,7 @@ class Agent:
 
     async def _start(self, cwd: Path, wanted: str | None, servers: list[McpSpec]) -> Session:
         """Start the MCP servers, then the serve for a new session (or session ``wanted``), and
-        attach to it. Nothing is left running when this raises."""
+        attach to it. Nothing is left running when this raises. The session is not held yet."""
         relay = await Relay.start(servers, cwd) if servers else None
         try:
             session = await self._start_serve(cwd, wanted, relay)
@@ -179,37 +213,57 @@ class Agent:
             raise
         session.relay = relay
         session.servers = {spec.name: spec for spec in servers}
-        self._sessions[session.id] = session
         return session
 
     async def _start_serve(self, cwd: Path, wanted: str | None, relay: Relay | None) -> Session:
         # The extension is loaded only when there are MCP tools: with none, τ's tool set is
         # exactly what it is without tau-acp.
-        args = [*relay.serve_args, *self._serve_args] if relay else self._serve_args
+        args, environ = self._serve_args, None
+        if relay is not None and relay.has_tools:
+            args, environ = [*relay.serve_args, *args], relay.environ
         try:
-            record = await serve.start(cwd, args, wanted, relay.environ if relay else None)
+            record = await serve.start(cwd, args, wanted, environ)
         except serve.ServeError as error:
             code = RESOURCE_NOT_FOUND if error.kind == "UnknownSession" else -32603
             data = {"sessionId": wanted} if code == RESOURCE_NOT_FOUND else None
             raise RpcError(code, str(error), data) from None
-        if not record.started:
-            raise RpcError(
-                -32603,
-                f"session {record.session} is already served by pid {record.pid}: "
-                f"stop it with `tau serve --stop --session {record.session}`",
-            )
-        assert self.conn is not None
         try:
+            _check_record(record, wanted)
+            assert self.conn is not None
             return await Session.attach(self.conn, record)
         except BaseException:
-            await _stop(record)
+            if record.started:  # not ours otherwise: another process serves it
+                await _stop(record)
             raise
 
     async def _release(self, session: Session) -> None:
-        await session.close()
-        await _stop(session.record)
-        if session.relay is not None:
-            await session.relay.stop()
+        """Disconnect, stop the serve if it is still ours, then the MCP servers and the relay
+        directory. Each step is tried whatever the others did; a failure is logged."""
+        try:
+            await session.close()
+            await _stop(session.record)
+        finally:
+            if session.relay is not None:
+                await session.relay.stop()
+
+
+def _check_record(record: serve.ServeRecord, wanted: str | None) -> None:
+    """``RpcError`` unless the serve ``tau serve`` started or found is the session asked for,
+    and is ours."""
+    if wanted is not None and record.session != wanted:
+        # τ takes an id prefix or a name for --session: the editor's key is the full id only.
+        raise RpcError(
+            RESOURCE_NOT_FOUND,
+            f"no session {wanted}: tau-acp opens sessions by their full id "
+            f"(τ resolved it to {record.session})",
+            {"sessionId": wanted},
+        )
+    if not record.started:
+        raise RpcError(
+            -32603,
+            f"session {record.session} is already served by pid {record.pid}: "
+            f"stop it with `tau serve --stop --session {record.session}`",
+        )
 
 
 async def _opened(session: Session, result: dict[str, Any]) -> dict[str, Any]:
@@ -222,7 +276,7 @@ async def _opened(session: Session, result: dict[str, Any]) -> dict[str, Any]:
 async def _stop(record: serve.ServeRecord) -> None:
     try:
         await serve.stop(record)
-    except serve.ServeError as error:
+    except Exception as error:  # the session is closed all the same: say what is left
         log(f"session {record.session}: {error}")
 
 

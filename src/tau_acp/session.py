@@ -8,7 +8,7 @@ from typing import Any
 from tau import Client, CursorGone, CursorView, Labels, RemoteClient
 
 from tau_acp import serve, translate
-from tau_acp.jsonrpc import INTERNAL_ERROR, INVALID_PARAMS, Connection, Params, RpcError
+from tau_acp.jsonrpc import INTERNAL_ERROR, INVALID_PARAMS, Connection, Params, RpcError, log
 from tau_acp.mcp import McpSpec
 from tau_acp.relay import Relay
 from tau_acp.serve import ServeRecord
@@ -184,8 +184,10 @@ class Session:
 
     async def close(self) -> None:
         """Disconnect from the serve. (Stopping it is the caller's.)"""
-        with contextlib.suppress(Exception):
+        try:
             await self._client.close()
+        except Exception as error:  # we are leaving it anyway
+            log(f"session {self.id}: disconnecting: {error!r}")
 
 
 async def _snapshot(client: Client) -> dict[int, CursorView]:

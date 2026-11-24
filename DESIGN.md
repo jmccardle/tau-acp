@@ -49,12 +49,28 @@ editor ──stdio (ACP JSON-RPC)──> tau-acp ──Unix socket (τ wire, Rem
   - tau-acp reads the one-line JSON record from stdout and connects with
     `tau.RemoteClient.connect(record["socket"], "tau-acp")`.
 - **Stopping:** tau-acp stops the serve when the session closes, or when the editor closes
-  stdin (`tau serve --stop --session ID --json`, then SIGTERM to the recorded pid if it is
-  still alive). The session log stays on disk, so `session/load` can come back to it. (Exception, found in
-  A1: τ discards a session that never received input when its serve stops, so a `session/new`
-  closed before its first prompt cannot be loaded.)
+  stdin or tau-acp is signalled (`tau serve --stop --session ID --json`). The session log stays on
+  disk, so `session/load` can come back to it. (Exception, found in A1: τ discards a session that
+  never received input when its serve stops, so a `session/new` closed before its first prompt
+  cannot be loaded.)
+  - **Only a serve that is still ours is stopped.** First tau-acp reads the session's record
+    file (`$TAU_HOME/serve/<id>.json`): if it is gone, nothing is running; if it names another
+    pid, another serve holds the session now (a dead session that was started again by someone
+    else), it is left running, and the reason is logged. Only a record naming our pid is passed to
+    `--stop`, which itself checks the pid over the socket. tau-acp never signals a pid itself: a
+    pid can be reused. A serve that does not stop within 5 seconds is logged and left.
+  - **A session that is dead** (its serve exited, or its stream was cut off) is released the same
+    way: the check above is what tells a stale record from a successor.
+  - **Going away during `session/new` or `session/load`** (stdin closes, a signal) lets the
+    `tau serve -d` that is starting finish, then stops the serve it started, so none is orphaned.
+    A serve that was already running (`started` false) is never stopped.
+  - **`session/close` and shutdown always release everything:** if the serve is already gone
+    and the abort fails, that is logged, and the MCP servers and the relay directory are still
+    released. Shutdown releases the sessions together, and one session's failure does not
+    skip another's.
 - **`record["started"] == false`** means another process already serves the session. tau-acp
-  replies with an error that names the pid and `tau serve --stop --session ID`. It never attaches.
+  replies with an error that names the pid and `tau serve --stop --session ID`. It never attaches,
+  and never stops it.
 - **User serve args:** everything after `--` on tau-acp's command line goes to every
   `tau serve`. Examples: `--set 'permissions.ask=["bash"]'`, or `-e` for more extensions. The
   editor's agent configuration is where a user puts them.
@@ -118,7 +134,7 @@ editor ──stdio (ACP JSON-RPC)──> tau-acp ──Unix socket (τ wire, Rem
 | `session/new` | A1 (MCP in A2) | starts the MCP servers, then the serve; connects; reads the snapshot until `Labels`. Uses the lowest open cursor (a new session has cursor 0), calls `watch([cursor])` and sends `available_commands_update`. Returns `sessionId` = τ's session id, and `configOptions`. |
 | `session/prompt` | A1 | see "A turn" |
 | `session/cancel` | A1 | `abort(cursor)`; the pending prompt answers `cancelled` |
-| `session/load` | A1 | starts the serve with `--session ID`, then replays the history ("Replay") before answering. An unknown id gets `-32002`. A `cwd` that differs from τ's record gets `-32602` (checked once the serve is up, because the record is only known then; a serve started for the check is stopped). A session this connection already holds is replayed, not restarted, if its `mcpServers` are the same (name, command, args, env); if they differ the answer is `-32602` ("session X is already open with different MCP servers; close it first"), because keeping the old tools silently would be wrong. A held session whose serve died is released and started again. Results carry `configOptions`. |
+| `session/load` | A1 | starts the serve with `--session ID`, then replays the history ("Replay") before answering. An unknown id gets `-32002`, and so does anything but a session's full id: τ's `--session` also takes an id prefix or a name, but then the serve's session is not the key the editor used, so the serve (if tau-acp started it) is stopped and the answer is `-32002` with `data.sessionId`. A `cwd` that differs from τ's record gets `-32602` (checked once the serve is up, because the record is only known then; a serve started for the check is stopped). A session this connection already holds is replayed, not restarted, if its `mcpServers` are the same (name, command, args, env); if they differ the answer is `-32602` ("session X is already open with different MCP servers; close it first"), because keeping the old tools silently would be wrong. A held session whose serve died is released and started again. Results carry `configOptions`. |
 | `session/list` | A3 | `tau.list_sessions($TAU_HOME/sessions, cwd=…)`. Each session is `{sessionId, cwd, title?, updatedAt}`: `title` is τ's name, else the first message cut to one line of at most 80 characters, else omitted; `updatedAt` is the log's modification time, ISO 8601 UTC. `cwd` (when given) must be an absolute directory and filters exactly. No paging: no `nextCursor`, and any `cursor` that is not null gets `-32602` ("tau-acp does not page session/list"). A directory that is not a readable session (τ gives it an `error`) is left out, because ACP requires a `cwd` and the editor could not load it; each one is logged to stderr, so it is never silent. τ has no public function for `TAU_HOME`, so tau-acp reads `$TAU_HOME` (a leading `~` is `$HOME`, relative is an error), else `~/.tau`, as τ documents. |
 | `session/resume` | A3 | the same as load, without the replay. It still sends `available_commands_update` and returns `configOptions`. |
 | `session/close` | A3 | cancels the prompt in flight (which answers `cancelled`), then stops the serve, the MCP servers and the relay directory. `{}` for an unknown or already closed session. |

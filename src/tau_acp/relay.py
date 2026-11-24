@@ -6,7 +6,6 @@ and the relay").
 """
 
 import asyncio
-import contextlib
 import json
 import os
 import re
@@ -15,7 +14,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from tau_acp.jsonrpc import INVALID_PARAMS, RpcError
+from tau_acp.jsonrpc import INVALID_PARAMS, RpcError, log
 from tau_acp.mcp import (
     McpClient,
     McpError,
@@ -76,6 +75,11 @@ class Relay:
             raise
 
     @property
+    def has_tools(self) -> bool:
+        """Whether any MCP server lists a tool: if none does, τ needs no extension."""
+        return bool(self._clients)
+
+    @property
     def serve_args(self) -> list[str]:
         """What ``tau serve`` needs to load the extension."""
         return ["-e", str(EXTENSION)]
@@ -95,7 +99,7 @@ class Relay:
                 self._connection, socket, limit=LINE_LIMIT
             )
         except BaseException:
-            shutil.rmtree(self._directory, ignore_errors=True)
+            _remove(self._directory)
             raise
 
     async def stop(self) -> None:
@@ -106,7 +110,7 @@ class Relay:
             task.cancel()
         await asyncio.gather(*self._handlers, return_exceptions=True)
         await _stop_all(self._servers)
-        shutil.rmtree(self._directory, ignore_errors=True)
+        _remove(self._directory)
 
     async def _connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         task = asyncio.current_task()
@@ -190,5 +194,14 @@ def _naming(
 
 async def _stop_all(clients: list[McpClient]) -> None:
     for client in clients:
-        with contextlib.suppress(Exception):
+        try:
             await client.stop()
+        except Exception as error:  # the others must still be stopped
+            log(f"MCP server {client.name}: stopping it failed: {error!r}")
+
+
+def _remove(directory: Path) -> None:
+    """Remove the relay directory; what cannot be removed is logged."""
+    shutil.rmtree(
+        directory, onexc=lambda _function, path, error: log(f"cannot remove {path}: {error!r}")
+    )
