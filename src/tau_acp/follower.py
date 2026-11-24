@@ -1,7 +1,10 @@
-"""One prompt turn: send the text (or run the command), hear τ's events until the cursor rests,
-translate them to updates, answer τ's questions, and say how the turn ended.
+"""A session's one reader of τ's events, and the state of the prompt running on it.
 
-This is τ's own ``tau -p`` loop: the turn is the only reader of the client's events.
+τ's events are read by exactly one task at a time (a client has one consumer). Between prompts a
+background task reads them, so that nothing waits unread: a model changed from τ's side is
+announced at once, a stream that ended marks the session dead at once, and the next prompt does
+not start on stale events. A prompt ``pause``\\ s that task, hears what is held, and then reads the
+events itself, as τ's own ``tau -p`` does, until the cursor rests.
 """
 
 import asyncio
@@ -35,11 +38,12 @@ Ask = Callable[[Params], Awaitable[Any]]
 ModelChanged = Callable[[str | None], Awaitable[None]]
 PERMISSIONS = "permissions"
 PERMISSION_VALUES = ["yes", "always", "no"]
+PROGRESS_TAIL = 1 << 16  # characters of a running tool's output sent in a progress update
 
 
 @dataclass(frozen=True)
 class Editor:
-    """How a turn talks to the editor: the session's cwd, and sending an update and a
+    """How the follower talks to the editor: the session's cwd, and sending an update and a
     ``session/request_permission`` (whose result it returns) for the session."""
 
     cwd: str
@@ -48,12 +52,14 @@ class Editor:
     model_changed: ModelChanged
 
 
-class Turn:
-    """The state of one ``session/prompt``."""
+class Follower:
+    """Reads one cursor's events and translates them for the editor."""
 
     def __init__(self, client: Client, cursor: int, view: CursorView, editor: Editor) -> None:
         self.view = view
+        self.tip = view.at  # the last node of the cursor's line: only its children are ours
         self.cancelled = False
+        self.lost: str | None = None  # why the stream ended, once it has
         self._client = client
         self._cursor = cursor
         self._cwd = editor.cwd
@@ -68,18 +74,100 @@ class Turn:
         self._handled: set[int] = set()
         self._asked: set[str] = set()
         self._tasks: set[asyncio.Task[None]] = set()
+        self._background: asyncio.Task[None] | None = None
+        self._waiting = False  # the background task is blocked on the stream, holding no event
+        self._paused = True
+
+    # Between prompts
+
+    def start(self) -> None:
+        """Read the events in the background, until ``pause`` or the end of the stream."""
+        self._paused = False
+        if self.lost is None:
+            self._background = asyncio.get_running_loop().create_task(self._follow())
+
+    async def pause(self) -> None:
+        """Stop the background reading, and hear the events held at this moment. Nothing that was
+        read is lost: the task is only interrupted where it holds no event."""
+        self._paused = True
+        task, self._background = self._background, None
+        if task is not None:
+            if self._waiting:
+                task.cancel()
+            (outcome,) = await asyncio.gather(task, return_exceptions=True)
+            if isinstance(outcome, Exception):
+                raise outcome
+        if self.lost is None:
+            await self._drain()
+
+    async def stop(self) -> None:
+        """End the background reading and the answering of questions."""
+        self._paused = True
+        task, self._background = self._background, None
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await self.finish()
+
+    async def _follow(self) -> None:
+        try:
+            while not self._paused:
+                self._waiting = True
+                try:
+                    event = await self._next()
+                finally:
+                    self._waiting = False
+                await self.hear(event)
+        except ConnectionError as error:
+            log(f"the stream of the session ended: {error}")  # `lost` is set
+        except Exception as error:  # `pause` raises it, at the next prompt
+            log(f"hearing the session's events failed: {error!r}")
+            raise
+
+    async def _drain(self) -> None:
+        """Hear every event the client holds now, without waiting for more."""
+        while True:
+            try:
+                async with asyncio.timeout(0):
+                    event = await self._next()
+            except TimeoutError:
+                return
+            await self.hear(event)
+
+    async def stream_ends(self, seconds: float) -> bool:
+        """Hear events until the stream ends (True) or ``seconds`` pass (False)."""
+        try:
+            async with asyncio.timeout(seconds):
+                while True:
+                    await self.hear(await self._next())
+        except ConnectionError:
+            return True
+        except TimeoutError:
+            return False
+
+    def begin(self) -> None:
+        """Start a prompt. (``cancelled`` is the caller's: a cancel can come before this.)"""
+        self._stepped = False
+        self._last_stop = None
+
+    # A prompt
 
     async def run(self, text: str) -> str:
         """Run the prompt text; the ACP stop reason, or ``RpcError``."""
         try:
-            if text.startswith("/") and (parsed := await self._parse(text)) is not None:
+            parsed = None
+            if text.startswith("/"):
+                parsed = await self._parse(text)
+            if self.cancelled:  # the cancel came while the line was being read: run nothing
+                return "cancelled"
+            if parsed is not None:
                 return await self._command(parsed)
             return await self._message(text)
         except translate.TurnError as error:
             raise RpcError(INTERNAL_ERROR, str(error)) from None
 
     async def cancel(self) -> None:
-        """Abort the cursor; the turn then rests and answers ``cancelled``."""
+        """Abort the cursor; the prompt then rests and answers ``cancelled``."""
         self.cancelled = True
         await self._client.abort(self._cursor)
 
@@ -90,7 +178,7 @@ class Turn:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
-    # What the turn does
+    # What the prompt does
 
     async def _parse(self, line: str) -> Parsed | None:
         try:
@@ -105,8 +193,6 @@ class Turn:
         return parsed
 
     async def _message(self, text: str) -> str:
-        if self.cancelled:
-            return "cancelled"
         await self._client.send(self._cursor, text)
         if self.cancelled:  # the cancel came while the input was going in
             await self._client.abort(self._cursor)
@@ -150,11 +236,11 @@ class Turn:
 
     async def _rest(self) -> CursorView:
         """Hear events until the cursor's view is not busy; that view."""
-        async for event in self._client:
-            await self._hear(event)
+        while True:
+            event = await self._next()
+            await self.hear(event)
             if isinstance(event, CursorView) and event.cursor == self._cursor and not event.busy:
                 return event
-        raise ConnectionError("the session's stream ended before the cursor rested")
 
     async def _hear_until(self, call: "asyncio.Future[Any]") -> None:
         """Hear events while ``call`` runs, then those it published before it returned."""
@@ -169,7 +255,7 @@ class Turn:
                     await asyncio.wait({call, pending}, return_when=asyncio.FIRST_COMPLETED)
                 if pending.done():
                     event, pending = pending.result(), None
-                    await self._hear(event)
+                    await self.hear(event)
                 elif call.done():
                     return
         finally:
@@ -178,15 +264,21 @@ class Turn:
                 await asyncio.gather(pending, return_exceptions=True)
 
     async def _next(self) -> Event:
+        """The next event. The end of the stream is ``ConnectionError``, and is remembered."""
         try:
             return await anext(self._client)
         except StopAsyncIteration:
-            raise ConnectionError("the session's stream ended during the turn") from None
+            self.lost = "the session's stream ended"
+            raise ConnectionError(self.lost) from None
+        except ConnectionError as error:
+            self.lost = str(error) or type(error).__name__
+            raise
 
-    async def _hear(self, event: Event) -> None:
+    async def hear(self, event: Event) -> None:
+        """Translate one event: to the editor, or to a question to answer."""
         if isinstance(event, CursorView):
             before = self.view.model
-            self._view(event)
+            self._seen(event)
             if event.cursor == self._cursor and event.model != before:
                 await self._model_changed(event.model)
         elif isinstance(event, Live) and event.cursor == self._cursor:
@@ -197,10 +289,11 @@ class Turn:
         elif isinstance(event, Notice):
             await self._emit(translate.chunk("agent_message_chunk", f"\n[τ] {event.text}\n"))
 
-    def _view(self, view: CursorView) -> None:
+    def _seen(self, view: CursorView) -> None:
         if view.cursor != self._cursor:
             return
         self.view = view
+        self.tip = view.at
         self._stepped = self._stepped or view.busy
         for question in view.questions:
             if question.id in self._handled or question.to not in (None, self._client.id):
@@ -217,11 +310,16 @@ class Turn:
             await self._emit(translate.chunk("agent_thought_chunk", delta.text))
         elif isinstance(delta, ToolProgress):
             key = (delta.node, delta.call_id)
-            self._progress[key] = self._progress.get(key, "") + delta.text
-            identity = translate.call_id(delta.node, delta.call_id)
-            await self._emit(translate.tool_progress(identity, self._progress[key]))
+            tail = (self._progress.get(key, "") + delta.text)[-PROGRESS_TAIL:]
+            self._progress[key] = tail
+            await self._emit(translate.tool_progress(translate.call_id(*key), tail))
 
     async def _appended(self, node: Any) -> None:
+        if node.parent != self.tip:
+            # Another cursor's node (the stream carries every cursor's): not this line's.
+            log(f"ignored node {node.id}: its parent {node.parent} is not the tip {self.tip}")
+            return
+        self.tip = node.id
         body = node.body
         if isinstance(body, Body.Assistant):
             updates = translate.assistant_updates(node, self._cwd, self._text, self._thought)

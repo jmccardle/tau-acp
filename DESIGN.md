@@ -171,10 +171,16 @@ editor ──stdio (ACP JSON-RPC)──> tau-acp ──Unix socket (τ wire, Rem
      string, if any, is sent as an `agent_message_chunk`.
 
    Everything else goes to `send(cursor, text)`.
-3. **Waiting for the end.** Events are read until **rest**: the first non-busy `CursorView` of
+3. **Reading events.** τ's events always have a reader. Between prompts a background task reads them: it announces a model change that came from τ's side (`config_option_update`), sends a `Notice` or the nodes another client adds on this cursor's line, and notes the end of the stream (the session is dead from then on: its next request answers `-32603`, and `session/load` starts it again). A prompt pauses that task, hears what is already held, and reads the events itself until rest. It hands the reading back when it ends. So a prompt never starts on stale events.
+   - **A node is this line's if its parent is the line's tip** (the cursor's `at`, then each node
+     of the line). The stream carries every cursor's nodes: those of another cursor, whose
+     parent is not the tip, are logged to stderr and not translated. (A cursor opened at the
+     same node as ours, branching from our tip, could not be told apart. tau-acp attaches to
+     one cursor, and an extension that opens others at our tip is not supported.)
+4. **Waiting for the end.** Events are read until **rest**: the first non-busy `CursorView` of
    the cursor after the call returned. This is τ's own `tau -p` rule. `ending == Done` on a
    view that is still busy is not the end.
-4. **Stop reason**, from the rest view:
+5. **Stop reason**, from the rest view:
    - `Ending.Aborted` → `cancelled`.
    - `Ending.Failed(error)` → JSON-RPC error `-32603` with the error text.
    - `Ending.Halted(reason)` → JSON-RPC error `-32603` with "halted: <reason>".
@@ -183,7 +189,15 @@ editor ──stdio (ACP JSON-RPC)──> tau-acp ──Unix socket (τ wire, Rem
      `Length` → `max_tokens`; `Refused` → `refusal`; anything else → `-32603` naming it.
      Before that, if pending `items` remain or auto-step is off, the result is `-32603` with
      "stopped before finishing: …" (τ's `tau -p` verdict).
-   - After `session/cancel`, the answer is always `cancelled`, as ACP requires.
+   - After `session/cancel`, the answer is always `cancelled`, as ACP requires, whatever fails
+     after the cancel (the stream, a command, the stop reason). If the failure was the serve's
+     stream ending, the session is still marked dead. A cancel that comes while the prompt's
+     `/` line is still being parsed runs no command.
+   - A prompt that ends `Ending.Aborted` without a cancel from the editor means τ aborted it. If
+     τ's event stream ends within 10 seconds (τ winds down for up to 3 seconds before it ends
+     the streams), the serve exited: `-32603` and the session is dead. If not, `-32603` says τ
+     aborted the turn on its own. The pid is not looked at: a serve's process can outlive its
+     streams.
 
 ### Events to `session/update`
 
@@ -194,7 +208,7 @@ editor ──stdio (ACP JSON-RPC)──> tau-acp ──Unix socket (τ wire, Rem
 | `Appended` Assistant node | the node's text (its text parts joined) not already streamed goes as `agent_message_chunk` (thinking the same way, as `agent_thought_chunk`, without the visible line): if the streamed text is a prefix, only the rest is sent; if not, the final text is sent with a visible `[tau-acp: the streamed text was incomplete; the final text follows]` line in front. Each `Part.Call` → `tool_call`. |
 | `Appended` User node from another author (a hook, an extension) | `user_message_chunk` |
 | `Appended` Results node | `tool_call_update`, status `completed` (`Ok`) or `failed` (`Err`, `Interrupted`), with the text as `content`, and `rawOutput` |
-| `Live(ToolProgress)` | `tool_call_update`, status `in_progress`, with the accumulated text as `content` |
+| `Live(ToolProgress)` | `tool_call_update`, status `in_progress`, with the **last 65,536 characters** of the output so far as `content`. (A running call's output can grow without bound; resending all of it for every chunk would be quadratic. The complete output is in the final `completed` update.) |
 | `Notice(text)` | `agent_message_chunk` with the text `\n[τ] <text>\n` |
 | an open question | see "Questions" |
 

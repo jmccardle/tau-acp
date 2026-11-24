@@ -7,15 +7,15 @@ from typing import Any
 
 from tau import Client, CursorGone, CursorView, Labels, RemoteClient
 
-from tau_acp import serve, translate
+from tau_acp import translate
+from tau_acp.follower import Editor, Follower
 from tau_acp.jsonrpc import INTERNAL_ERROR, INVALID_PARAMS, Connection, Params, RpcError, log
 from tau_acp.mcp import McpSpec
 from tau_acp.relay import Relay
 from tau_acp.serve import ServeRecord
-from tau_acp.turn import Editor, Turn
 
 CLIENT_ID = "tau-acp"
-EXIT_WAIT_SECONDS = 2.0  # how long a turn aborted by τ waits to learn whether τ is exiting
+DEATH_WAIT_SECONDS = 10.0  # for τ's stream to end after it aborted a turn: τ winds down in 3
 
 
 class Session:
@@ -35,11 +35,12 @@ class Session:
         self._conn = conn
         self._client = client
         self._cursor = cursor
-        self._view = view
-        self._turn: Turn | None = None
+        self._follower = Follower(client, cursor, view, self._editor())
+        self._announce = True  # whether a model change heard is sent to the editor
+        self._running = False  # a prompt or command is running
         self.relay: Relay | None = None  # set by the agent, which stops it
         self.servers: dict[str, McpSpec] = {}  # the MCP servers it was opened with
-        self.dead: str | None = None  # why the serve is gone, once it is
+        self._dead: str | None = None
         self._idle = asyncio.Event()  # set while no prompt or command is running
         self._idle.set()
 
@@ -54,7 +55,16 @@ class Session:
         except BaseException:
             await client.close()
             raise
-        return cls(conn, record, client, cursor, views[cursor])
+        session = cls(conn, record, client, cursor, views[cursor])
+        session._follower.start()
+        return session
+
+    @property
+    def dead(self) -> str | None:
+        """Why the serve is gone, once it is: found when a call fails, or when its stream ends."""
+        if self._dead is None and self._follower.lost is not None:
+            self._dead = f"tau serve for session {self.id} exited: {self._follower.lost}"
+        return self._dead
 
     async def emit(self, update: translate.Update) -> None:
         """Send a ``session/update``."""
@@ -72,24 +82,24 @@ class Session:
 
     async def replay(self) -> None:
         """Send the conversation on the cursor's line, in order."""
-        nodes = await self._client.walk(self._view.at)
+        nodes = await self._client.walk(self._follower.view.at)
         for update in translate.replay_updates(nodes, self.cwd):
             await self.emit(update)
 
     @contextlib.contextmanager
     def alive(self) -> Iterator[None]:
         """Guard work on the serve: ``-32603`` if it is gone, and once it is found gone, always."""
-        if self.dead is not None:
-            raise RpcError(INTERNAL_ERROR, self.dead)
+        if (dead := self.dead) is not None:
+            raise RpcError(INTERNAL_ERROR, dead)
         try:
             yield
         except ConnectionError as error:
-            self.dead = f"tau serve for session {self.id} exited: {error}"
-            raise RpcError(INTERNAL_ERROR, self.dead) from None
+            self._dead = f"tau serve for session {self.id} exited: {error}"
+            raise RpcError(INTERNAL_ERROR, self._dead) from None
 
-    def _editor(self, *, announce_model: bool) -> Editor:
+    def _editor(self) -> Editor:
         async def model_changed(model: str | None) -> None:
-            if announce_model and model is not None:
+            if self._announce and model is not None:
                 options = await self.config_options(model)
                 await self.emit({"sessionUpdate": "config_option_update", "configOptions": options})
 
@@ -98,7 +108,7 @@ class Session:
     async def config_options(self, model: str | None = None) -> list[dict[str, Any]]:
         """The session's config options: the ``model`` select, or none when τ names no model.
         ``model`` is the current one, when it is known to have changed."""
-        current = model or self._view.model
+        current = model or self._follower.view.model
         if current is None:
             return []
         with self.alive():
@@ -123,59 +133,84 @@ class Session:
             raise RpcError(INVALID_PARAMS, "this session has no model config option")
         if value not in [o["value"] for o in options[0]["options"]]:
             raise RpcError(INVALID_PARAMS, f"unknown model {value!r}")
-        if value != self._view.model:
-            turn = self._begin(announce_model=False)
+        if value != self._follower.view.model:
+            with self.alive():
+                follower = await self._begin(announce_model=False)
             try:
                 with self.alive():
-                    await turn.set_model(value)
+                    await follower.set_model(value)
             finally:
-                await self._end(turn)
+                await self._end()
         return await self.config_options()
 
-    def _begin(self, *, announce_model: bool) -> Turn:
-        if self._turn is not None:
+    async def _begin(self, *, announce_model: bool) -> Follower:
+        """Take the reading of events over from the background, for a prompt."""
+        if self._running:
             raise RpcError(INVALID_PARAMS, "a prompt is already running")
+        self._running = True
         self._idle.clear()
-        self._turn = Turn(
-            self._client, self._cursor, self._view, self._editor(announce_model=announce_model)
-        )
-        return self._turn
+        self._follower.cancelled = False
+        try:
+            await self._follower.pause()
+        except BaseException:
+            await self._end()
+            raise
+        self._announce = announce_model
+        self._follower.begin()
+        return self._follower
 
-    async def _end(self, turn: Turn) -> None:
-        self._view = turn.view
-        self._turn = None
-        await turn.finish()
-        self._idle.set()
+    async def _end(self) -> None:
+        """The prompt is over: end its question tasks and read in the background again."""
+        try:
+            await self._follower.finish()
+        finally:
+            self._announce = True
+            self._follower.start()
+            self._running = False
+            self._idle.set()
 
     async def prompt(self, text: str) -> str:
-        """Run one turn; the ACP stop reason."""
+        """Run one turn; the ACP stop reason. A turn the editor cancelled answers ``cancelled``
+        whatever went wrong after the cancel, except that a serve found gone stays dead."""
         with self.alive():
-            turn = self._begin(announce_model=True)
-            try:
-                reason = await turn.run(text)
-                if reason == "cancelled" and not turn.cancelled:
-                    await self._aborted_from_outside()
-                return reason
-            finally:
-                await self._end(turn)
+            follower = await self._begin(announce_model=True)
+        try:
+            return await self._run(follower, text)
+        finally:
+            await self._end()
+
+    async def _run(self, follower: Follower, text: str) -> str:
+        try:
+            reason = await follower.run(text)
+        except ConnectionError as error:
+            self._dead = f"tau serve for session {self.id} exited: {error}"
+            if not follower.cancelled:
+                raise RpcError(INTERNAL_ERROR, self._dead) from None
+            return "cancelled"
+        except Exception as error:
+            if not follower.cancelled:
+                raise
+            log(f"session {self.id}: after a cancel: {error!r}")
+            return "cancelled"
+        if reason == "cancelled" and not follower.cancelled:
+            await self._aborted_from_outside()
+        return reason
 
     async def _aborted_from_outside(self) -> None:
         """The cursor was aborted, but not by us. Nothing else is attached, so τ did it: a serve
-        told to stop aborts its cursors first. Give it a moment to go; if it does, the turn ended
-        because the serve exited, which is an error and not a cancel."""
-        deadline = asyncio.get_running_loop().time() + EXIT_WAIT_SECONDS
-        while serve.alive(self.record.pid):
-            if asyncio.get_running_loop().time() > deadline:
-                raise RpcError(
-                    INTERNAL_ERROR, f"tau serve aborted the turn of session {self.id} on its own"
-                )
-            await asyncio.sleep(0.05)
-        raise ConnectionError("the process is gone")
+        told to stop aborts its cursors first, and then ends the stream (after up to 3 seconds of
+        winding down). If the stream ends within ``DEATH_WAIT_SECONDS`` the turn ended because the
+        serve exited, which is an error and not a cancel; the pid is not looked at."""
+        if await self._follower.stream_ends(DEATH_WAIT_SECONDS):
+            raise RpcError(INTERNAL_ERROR, self.dead or "the serve exited")
+        raise RpcError(
+            INTERNAL_ERROR, f"tau serve aborted the turn of session {self.id} on its own"
+        )
 
     async def cancel(self) -> None:
         """Cancel the turn in flight; nothing when there is none."""
-        if self._turn is not None:
-            await self._turn.cancel()
+        if self._running:
+            await self._follower.cancel()
 
     async def cancel_and_wait(self) -> None:
         """Cancel the turn in flight and wait until it has answered."""
@@ -185,6 +220,7 @@ class Session:
     async def close(self) -> None:
         """Disconnect from the serve. (Stopping it is the caller's.)"""
         try:
+            await self._follower.stop()
             await self._client.close()
         except Exception as error:  # we are leaving it anyway
             log(f"session {self.id}: disconnecting: {error!r}")
