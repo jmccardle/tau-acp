@@ -3,6 +3,6 @@
 Run it as an ACP agent: `tau-acp` on stdio. See the README.
 """
 
-__version__ = "0.0.1"
+__version__ = "0.1.0"
 
 __all__ = ["__version__"]

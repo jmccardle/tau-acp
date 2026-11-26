@@ -1,0 +1,71 @@
+# Publishes ffwf-tau-acp to PyPI with trusted publishing (no token), on a version tag only.
+#
+# One-time setup, by the project's owner, on PyPI: add a pending publisher for the project
+# `ffwf-tau-acp` with owner `jmccardle`, repository `tau-acp`, workflow `publish.yml` and
+# environment `pypi`; and create the environment `pypi` in the repository's settings.
+name: publish
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: The tag is the version
+        run: |
+          version=$(python -c "import re, pathlib; print(re.search(r'__version__ = \"([^\"]+)\"', pathlib.Path('src/tau_acp/__init__.py').read_text()).group(1))")
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "tag ${GITHUB_REF_NAME} is not v${version} (src/tau_acp/__init__.py)" >&2
+            exit 1
+          fi
+      - name: Build the wheel and the sdist
+        run: |
+          python -m pip install build
+          python -m build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  test:
+    # The suite, against the built wheel and not the source tree: a fresh environment holding
+    # the wheel, its dependencies from PyPI (ffwf-tau included), and the test requirements.
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Install the wheel into a fresh environment
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install dist/*.whl pytest "agent-client-protocol==1.0.0"
+      - name: Run the tests against it
+        # The repository root has no tau_acp (it is under src/), so the wheel is what is imported.
+        run: |
+          "$RUNNER_TEMP/venv/bin/python" -c "import tau_acp; print(tau_acp.__file__)"
+          "$RUNNER_TEMP/venv/bin/python" -m pytest -q
+
+  publish:
+    needs: [build, test]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
