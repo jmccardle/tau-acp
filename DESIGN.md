@@ -14,6 +14,7 @@ whichever one is wrong. Never paper over the difference.
 - ACP v1 (`protocolVersion: 1`, stable schema) on the agent side, over stdio.
 - One local τ: tau-acp, `tau serve` and the files being edited are all on one machine.
 - `tau serve` uses its Unix socket only.
+- τ 0.18 (`ffwf-tau>=0.18,<0.19`): wire protocol 3, which must match τ's exactly.
 - A session that tau-acp starts has exactly one consumer: tau-acp.
 
 **Out of scope, by decision:**
@@ -27,11 +28,17 @@ whichever one is wrong. Never paper over the difference.
 - The client's `fs/*` and `terminal/*` methods. The files are local, so τ's own base tools are
   the right tools, and ACP v2 removes these methods anyway.
 - `http`/`sse` MCP servers.
-- `image`/`audio` prompts.
-- Images in tool results as ACP `image` content blocks: an ACP image needs its bytes, and τ 0.17's
-  wire carries only an image's reference. When τ's `Client` can fetch an image's bytes (D30's
-  next slice), a result's images can go as `image` blocks after its text.
-- `elicitation/create`.
+- `audio` prompts.
+- Images in tool results as ACP `image` content blocks. τ 0.18's `Client.image(sha256)` can
+  fetch the bytes, so this can be built; a result's images are still a line each,
+  `[image WxH mime]`, after its text.
+- Questions whose answer is not one string, boolean, number or choice of strings (a list, say):
+  an ACP form has no field for them.
+
+**What the editor can do is asked, not assumed.** `initialize`'s `clientCapabilities` say whether
+the editor takes `elicitation/create` (form mode) and ACP's `notice` update, both of which ACP
+marks unstable or gates by capability. Without the capability tau-acp does the plain thing (a
+question is declined with a line in the chat, a notice is a chat line); with it, the richer one.
 
 **τ itself is never changed.** tau-acp uses only τ's public API (`tau`, `tau.cli`). If a
 behaviour seems to need a τ change, that is a stop-and-ask, not a workaround.
@@ -160,19 +167,45 @@ editor ──stdio (ACP JSON-RPC)──> tau-acp ──Unix socket (τ wire, Rem
 - **`http`/`sse` entries:** these get a `-32602` error ("tau-acp supports stdio MCP servers only"). tau-acp advertises
   `mcpCapabilities: {http: false, sse: false}`.
 
+### Plan: τ's `mcp` built-in replaces the relay
+
+τ 0.18.0 is getting an `mcp` built-in (D24 section 12), ported from this relay: it starts MCP
+servers inside τ, offers their tools as `mcp__SERVER__TOOL` (the same names), sends
+`notifications/cancelled` on an abort, and runs through `permissions` like any tool. When it is
+in the τ that tau-acp pins, tau-acp stops starting MCP servers itself:
+
+- the editor's `mcpServers` go to the serve, which starts them: the relay, `_extension.py`,
+  `mcp.py` and `relay.py` are deleted, and with them `TAU_ACP_RELAY` and the `-e` of the
+  extension;
+- the serve is started with the built-in on (it is off by default: `--set load.mcp=true`);
+- a server that fails to start fails `session/new` as today: τ's start refuses with every failing
+  server named, and tau-acp passes that error on as `-32603`;
+- the tests keep their cases (names, errors, cancellation, permissions, lifetime, `ping`, a
+  malformed message) and run them against τ's built-in instead of the relay;
+- `http` entries become possible (τ's built-in speaks streamable HTTP): `mcpCapabilities.http`
+  turns true and the `-32602` goes. `sse` stays refused.
+
+**What it needs from τ, not built yet:** the built-in reads servers only from files
+(`$TAU_HOME/mcp.json`, the project's `.mcp.json` and `.tau/mcp.json`). tau-acp must hand τ one
+session's servers without writing into the user's files or the project's, so τ needs a route for
+a client or the command line to give a serve its servers: `tau serve --mcp-config PATH`, or the
+extension's option. Until τ has one, tau-acp keeps its relay. Two differences to watch when
+switching: the editor's `env` values are added to τ's environment for that server in both; and
+the relay's text-only results become τ's images (D30), which ACP can show.
+
 ## ACP methods
 
 | method | phase | behaviour |
 |---|---|---|
-| `initialize` | A1 | answers `protocolVersion: 1` (it echoes 1; for any other version it still answers 1), `agentCapabilities {loadSession: true, promptCapabilities {image: false, audio: false, embeddedContext: true}, mcpCapabilities {http: false, sse: false}, sessionCapabilities {list: {}, resume: {}, close: {}}}`, `authMethods: []` and `agentInfo {name: "tau-acp", version}`. |
-| `session/new` | A1 (MCP in A2) | starts the MCP servers, then the serve; connects; reads the snapshot until `Labels`. Uses the lowest open cursor (a new session has cursor 0), calls `watch([cursor])` and sends `available_commands_update`. Returns `sessionId` = τ's session id, and `configOptions`. |
+| `initialize` | A1 | keeps the editor's `clientCapabilities` (`elicitation.form`, `session.notices`); answers `protocolVersion: 1` (it echoes 1; for any other version it still answers 1), `agentCapabilities {loadSession: true, promptCapabilities {image: true, audio: false, embeddedContext: true}, mcpCapabilities {http: false, sse: false}, sessionCapabilities {list: {}, resume: {}, close: {}}}`, `authMethods: []` and `agentInfo {name: "tau-acp", version}`. |
+| `session/new` | A1 (MCP in A2) | starts the MCP servers, then the serve; connects; reads the snapshot until `Labels`, keeping its `Commands`. Uses the lowest open cursor (a new session has cursor 0), calls `watch([cursor])` and sends `available_commands_update` (from the `Commands` event; see "Commands"). Returns `sessionId` = τ's session id, and `configOptions`. |
 | `session/prompt` | A1 | see "A turn" |
 | `session/cancel` | A1 | `abort(cursor)`; the pending prompt answers `cancelled` |
 | `session/load` | A1 | starts the serve with `--session ID`, then replays the history ("Replay") before answering. An unknown id gets `-32002`, and so does anything but a session's full id: τ's `--session` also takes an id prefix or a name, but then the serve's session is not the key the editor used. The id is resolved with `tau.find_session` before anything starts, and anything but an exact id is answered `-32002` with `data.sessionId` (naming the session τ would have opened, if any). The record's session is checked again once the serve is up. A `cwd` that differs from τ's record gets `-32602` (checked once the serve is up, because the record is only known then; a serve started for the check is stopped). A session this connection already holds is replayed, not restarted, if its `mcpServers` are the same (name, command, args, env); if they differ the answer is `-32602` ("session X is already open with different MCP servers; close it first"), because keeping the old tools silently would be wrong. A held session whose serve died is released and started again. Results carry `configOptions`. |
 | `session/list` | A3 | `tau.list_sessions($TAU_HOME/sessions, cwd=…)`. Each session is `{sessionId, cwd, title?, updatedAt}`: `title` is τ's name, else the first message cut to one line of at most 80 characters, else omitted; `updatedAt` is the log's modification time, ISO 8601 UTC. `cwd` (when given) must be an absolute directory and filters exactly. No paging: no `nextCursor`, and any `cursor` that is not null gets `-32602` ("tau-acp does not page session/list"). A directory that is not a readable session (τ gives it an `error`) is left out, because ACP requires a `cwd` and the editor could not load it; each one is logged to stderr, so it is never silent. τ has no public function for `TAU_HOME`, so tau-acp reads `$TAU_HOME` (a leading `~` is `$HOME`, relative is an error), else `~/.tau`, as τ documents. |
 | `session/resume` | A3 | the same as load, without the replay. It still sends `available_commands_update` and returns `configOptions`. |
 | `session/close` | A3 | cancels the prompt in flight (which answers `cancelled`), then stops the serve, the MCP servers and the relay directory. `{}`; `{}` too for an unknown or already closed session. If the serve was already gone (found dead, or its process had exited) or dies during the close, everything is released all the same, and the answer is `-32603` naming why, "(the session is closed)", with `data {sessionId}`: what ran in the serve was lost. |
-| `session/set_config_option` | A3 | the one option, `model`: a `select`, `category: "model"`, `currentValue` = `CursorView.model`, options from `complete(cursor, "model", "")` (each `value` and `name` is τ's model name; if the current model is not among them it is added first, since it is a real value). An unknown `configId`, a non-select `type`, or a value that is not an option gets `-32602`. Otherwise τ's `model` command runs (as a task while events are read) and the answer is the full `configOptions`. A model change that comes from τ's side (a `/model` in a prompt) sends `config_option_update` with the full set; one the editor asked for does not (the answer carries it). If τ names no model (`CursorView.model` is `None`), `configOptions` is left out of the results and the option is not offered. |
+| `session/set_config_option` | A3 | the one option, `model`: a `select`, `category: "model"`, `currentValue` = `CursorView.model`, options from `complete(cursor, "model", "")` (each `value` and `name` is a completion's `value`, τ's model name; if the current model is not among them it is added first, since it is a real value). An unknown `configId`, a non-select `type`, or a value that is not an option gets `-32602`. Otherwise τ's `model` command runs (as a task while events are read) and the answer is the full `configOptions`. A model change that comes from τ's side (a `/model` in a prompt) sends `config_option_update` with the full set; one the editor asked for does not (the answer carries it). If τ names no model (`CursorView.model` is `None`), `configOptions` is left out of the results and the option is not offered. |
 
 - Unknown methods get `-32601`. Unknown notifications are ignored. Any request before
   `initialize` gets `-32600`.
@@ -191,14 +224,22 @@ editor ──stdio (ACP JSON-RPC)──> tau-acp ──Unix socket (τ wire, Rem
 
 ### A turn (`session/prompt`)
 
-1. **Building the prompt text.** The `prompt` blocks become one text:
+1. **Building the prompt.** The `prompt` blocks become one text and some images:
    - `text` blocks are used as they are;
    - a `resource_link` becomes `[<name>](<uri>)`;
    - an embedded text `resource` becomes a fenced block headed by its URI;
-   - a blob `resource`, `image` or `audio` gets `-32602`.
+   - an `image` block becomes one of τ's `ImageInput`s (its base64 `data`), sent with the text
+     (τ puts a message's images after its text; a prompt of images alone has the empty text).
+     τ reads the format and size from the bytes: anything but a PNG, JPEG, GIF or WebP of at most
+     `tau.MAX_INPUT_BYTES` (20 MiB), or more than `tau.MAX_INPUT_IMAGES` (20), gets `-32602`;
+   - a blob `resource` or `audio` gets `-32602`.
 
-   Consecutive blocks are joined with a blank line.
-2. **A line that starts with `/`** goes to `parse_line(cursor, line)`:
+   Consecutive text blocks are joined with a blank line. A model that takes no images makes τ
+   refuse the input (`Refused`): that is `-32602` with τ's reason, and nothing is queued. The
+   editor is told `promptCapabilities.image: true` whatever the model, because the model can
+   change in the session.
+2. **A line that starts with `/`** goes to `parse_line(cursor, line)`. (A command takes no
+   images: a prompt with both is `-32602`.)
    - `UnknownCommand` sends it as text;
    - `ValueError`/`LookupError` gets `-32602` with τ's message;
    - `missing` arguments get `-32602` naming them;
@@ -246,11 +287,12 @@ editor ──stdio (ACP JSON-RPC)──> tau-acp ──Unix socket (τ wire, Rem
 |---|---|
 | `Live(TextDelta)` | `agent_message_chunk` (text) |
 | `Live(ThinkingDelta)` | `agent_thought_chunk` |
-| `Appended` Assistant node | the node's text (its text parts joined) not already streamed goes as `agent_message_chunk` (thinking the same way, as `agent_thought_chunk`, without the visible line): if the streamed text is a prefix, only the rest is sent; if not, the final text is sent with a visible `[tau-acp: the streamed text was incomplete; the final text follows]` line in front. Each `Part.Call` → `tool_call`. |
-| `Appended` User node from another author (a hook, an extension) | `user_message_chunk` |
+| `Commands(forms)` | `available_commands_update`, once the editor knows the session and whenever the list differs from the last one sent (see "Commands") |
+| `Appended` Assistant node | the node's text (its text parts joined) not already streamed goes as `agent_message_chunk` (thinking the same way, as `agent_thought_chunk`, without the visible line): if the streamed text is a prefix, only the rest is sent; if not, the final text is sent with a visible `[tau-acp: the streamed text was incomplete; the final text follows]` line in front. Each `Part.Call` → `tool_call`. Then, if the reply's `meta.usage` has `input` and `output` and the model's config has a `context_window`, a `usage_update` (see "Usage"). |
+| `Appended` User node from another author (a hook, an extension) | `user_message_chunk` for its text (left out when empty), then one for each image, as an `image` block (bytes from `Client.image`) |
 | `Appended` Results node | `tool_call_update`, status `completed` (`Ok`) or `failed` (`Err`, `Interrupted`), with the text as `content`, and `rawOutput`. An `Ok` with images (τ's protocol 2) adds a line per image after its text, `[image WxH mime]`, as τ's TUI shows it: τ's wire carries an image's reference (mime, sha256, size), not its bytes, so it cannot be an ACP `image` block. |
 | `Live(ToolProgress)` | `tool_call_update`, status `in_progress`, with the **last 65,536 characters** of the output so far as `content`. (A running call's output can grow without bound; resending all of it for every chunk would be quadratic. The complete output is in the final `completed` update.) |
-| `Notice(text)` | `agent_message_chunk` with the text `\n[τ] <text>\n` |
+| `Notice(text, cursor, extension, level)` | a notice about another cursor is logged and dropped. For an editor that advertised `session.notices`: ACP's `notice` update, `severity` = `level`, `title` = `[<extension or τ>] <first line>` (cut to 80), `description` = the whole text when it has more than that line. Otherwise an `agent_message_chunk` with `\n[<extension or τ>] <text>\n`, the level named (`warning: `, `error: `) when it is not `info`. |
 | an open question | see "Questions" |
 
 - **`toolCallId`** is `"<assistant node id>:<call id>"`. Provider call ids can repeat, so the
@@ -282,21 +324,63 @@ editor ──stdio (ACP JSON-RPC)──> tau-acp ──Unix socket (τ wire, Rem
     exactly what τ asks, whatever the match.
   - The answer goes to `answer(id, value)`. `cancelled`, an error response or an unknown option
     is answered with `None` (decline).
-- **Any other question** is declined (`answer(id, None)`), and an `agent_message_chunk` says so:
-  `[tau-acp] declined a question ACP cannot carry: <text>`. It is never left open, because the
-  turn could not end.
+- **Any other question** is asked through ACP's `elicitation/create` (form mode), when the editor
+  advertised `clientCapabilities.elicitation.form`, and its answer type is one a form has a field
+  for: τ's JSON Schema is a string, a boolean, an integer, a number, or an `enum` of strings.
+  The form is one field, `answer`, titled "Answer", required, with the question's text as the
+  `message`; the request carries the `sessionId`. An `accept` answers the question with the
+  field's value. `decline`, `cancel`, an error response, or a malformed result answer it `None`
+  (decline). A value τ refuses (`Refused`: the wrong type, or not one of the choices) also
+  declines, because a question left open keeps the cursor busy.
+- **Otherwise** (no `elicitation.form` capability, or an answer type a form cannot ask: a list, an
+  object, a union) the question is declined (`answer(id, None)`), and an `agent_message_chunk`
+  says so: `[tau-acp] declined a question ACP cannot carry: <text>`. It is never left open,
+  because the turn could not end.
+- ACP marks elicitation unstable in the SDK that tau-acp's tests use (`agent-client-protocol`
+  1.0.0). It is used only when the editor opts in with its capability, so an editor that does not
+  know it is never sent one.
+
+### Commands
+
+τ's stream opens with a `Commands` event (before the `CursorView`s) and sends one again whenever
+the command forms change: an extension's start, `/reload`, a skill file, `tree.reassemble()`.
+tau-acp keeps the latest, sends the `available_commands_update` right after the response of
+`session/new`, `session/load` or `session/resume` (the editor does not know the session id
+before), and sends another whenever a `Commands` makes the list differ from the one last sent.
+It never calls `commands()`.
+
+**`/new` is not tau-acp's.** A client implements a command only where it can act on it. A new
+session in ACP is `session/new`, which the editor sends; tau-acp has no `/new` command and does
+not refuse one. A prompt `/new` is τ's to parse: if τ has such a command it runs, and if not it
+is text for the model, as any unknown `/word`. (The same holds for `/resume` and `/fork`.)
+
+### Usage
+
+After a reply that reported `meta.usage` (τ's normalized `input` and `output` counts), tau-acp
+sends ACP's `usage_update`: `used` = `input + output` of that reply (the prompt τ sent and what
+came back: the context now, as τ's own `ctx %` is figured), `size` = the model's `context_window`.
+`cost` is not sent.
+
+τ's wire does not carry a model's `context_window`: it is in τ's config. tau-acp reads the
+config files with `tau.load_config(cwd, environ, ask=None)` once per session, as the serve does
+(without the serve's `--set` overrides). No `context_window` for the model, or a config that
+cannot be read from there (an untrusted project, an invalid file; logged once), means no
+`usage_update`: `size` is required and unknown. A reply with no `usage`, or one that is not the
+documented shape, sends nothing (the latter is logged).
 
 ### Replay (`session/load`)
 
 The cursor's line, `walk(view.at)`, is sent in order:
 
-- **User** nodes → `user_message_chunk`.
+- **User** nodes → `user_message_chunk` for the text (left out when empty and there are images),
+  then one per image as an `image` block, its bytes fetched with `Client.image(sha256)`.
 - **Assistant** nodes, part by part:
   - Thinking → `agent_thought_chunk`;
   - Text → `agent_message_chunk`;
   - Call → `tool_call` (status `pending`).
 - **Results** nodes → `tool_call_update` (final status).
 - **System and Config** nodes are skipped.
+- Replay sends no `usage_update`.
 
 The response comes only after the last notification.
 
@@ -350,3 +434,8 @@ The response comes only after the last notification.
   - `-32602` for http/sse.
 - **A3 — the rest of the stable methods:** `session/list`, `session/resume`, `session/close`,
   the model config option, and failure handling (serve death; MCP death was done in A2).
+- **A4 — τ 0.18 (protocol 3), release candidate 0.1.0:**
+  - user images both ways (image prompt blocks, `user_message_chunk` image blocks in replay);
+  - `Commands` instead of `commands()`; attributed notices; `Completion` items;
+  - questions through `elicitation/create`; `usage_update`;
+  - release prep (`publish.yml`); the `mcp` built-in switch-over is planned above, not done.

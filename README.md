@@ -8,7 +8,7 @@ translates between the two. [DESIGN.md](DESIGN.md) is the contract.
 Everything runs on one machine: tau-acp, the `tau serve` processes it starts, and the files
 being edited.
 
-## Status: phase A3
+## Status: 0.1.0 release candidate, for τ 0.18
 
 Works now:
 
@@ -20,11 +20,18 @@ Works now:
 - A `tau serve` that dies fails the pending prompt with an error naming the session; the session
   stays dead until `session/load` or `session/resume` starts it again.
 - Streamed replies and thinking, tool calls with their results and live output, and τ's
-  notices.
+  notices (each says which extension spoke and how loud: `[ext] warning: ...` in the chat, or
+  ACP's `notice` update for an editor that advertises it).
+- Images in prompts: an image block goes to τ with the text, if the model takes images (τ
+  refuses it otherwise, and you see why). A session's images come back when it is loaded.
+- Context use: a `usage_update` after each reply, for a model whose τ config sets
+  `context_window`.
 - Tool permissions: when τ asks (for example with a `permissions.ask` rule), the editor gets a
   `session/request_permission` with allow once / always allow / reject. The request always shows
   the question's own text, and names the tool call only when the text identifies exactly one.
-  Any other question τ asks is declined, with a line in the chat saying so.
+  Any other question τ asks (an extension's yes/no, a text, a choice) goes to an editor that
+  advertises ACP's form elicitation as a form with one field. For an editor that does not, or a
+  question a form cannot ask (a list), it is declined with a line in the chat saying so.
 - τ's slash commands (`/usage`, `/model NAME`, ...) are advertised to the editor and run when
   typed. An unknown `/word` goes to the model as text.
 - Closing stdin (or SIGTERM) stops every `tau serve` it started and exits 0.
@@ -41,8 +48,10 @@ Limits, by decision:
 
 - MCP servers are stdio only (`http`/`sse` are refused).
 - No `fs/*` or `terminal/*` client methods: τ's own tools work on the local files.
-- No image or audio prompts. An image a τ tool returns shows as a line, `[image WxH mime]`,
-  after the result's text: τ's wire does not carry an image's bytes yet.
+- No audio prompts. An image a τ tool returns shows as a line, `[image WxH mime]`, after the
+  result's text.
+- τ's `/new`, `/resume` and `/fork` are not tau-acp's: a new session is the editor's
+  `session/new`.
 - Unstable ACP methods (`session/fork` and others) are not supported.
 - Local only: tau-acp, its `tau serve` processes and the files are on one machine, and there is
   no network transport. A session some other process serves is never attached to.
@@ -52,12 +61,37 @@ Limits, by decision:
 ## Setup
 
 ```bash
-pip install ffwf-tau-acp        # brings ffwf-tau 0.17
+pip install ffwf-tau-acp        # brings ffwf-tau 0.18 (protocol 3)
 ```
 
 τ needs a model: set `default_model` in its config (`$TAU_HOME/config.json`, default
 `~/.tau/config.json`), because `tau serve` takes no model argument. If there is none, the
 editor sees τ's error when it creates a session.
+
+### Zed
+
+Zed runs it as a custom external agent. In `settings.json` (`zed: open settings`), as described in
+[Zed's external agents page](https://zed.dev/docs/ai/external-agents):
+
+```json
+{
+  "agent_servers": {
+    "tau": {
+      "type": "custom",
+      "command": "tau-acp",
+      "args": [],
+      "env": {}
+    }
+  }
+}
+```
+
+Then pick it from the `+` menu of the agent panel. Zed needs `tau-acp` on its `PATH`: if you
+installed it in a virtual environment, give the full path in `command`. To pass options to every
+`tau serve`, put them in `args` after `--` (below). Older Zed versions have no `type` key; leave
+it out there.
+
+### Other editors
 
 In the editor's agent configuration, the command is `tau-acp` with no arguments. To pass options
 to every `tau serve` it starts, put them after `--`:
