@@ -21,12 +21,12 @@ from tau_acp.jsonrpc import (
 )
 from tau_acp.mcp import McpSpec, parse_servers
 from tau_acp.relay import Relay
-from tau_acp.session import Session
+from tau_acp.session import EditorFeatures, Session
 
 PROTOCOL_VERSION = 1
 CAPABILITIES = {
     "loadSession": True,
-    "promptCapabilities": {"image": False, "audio": False, "embeddedContext": True},
+    "promptCapabilities": {"image": True, "audio": False, "embeddedContext": True},
     "mcpCapabilities": {"http": False, "sse": False},
     "sessionCapabilities": {"list": {}, "resume": {}, "close": {}},
 }
@@ -40,6 +40,7 @@ class Agent:
         self._serve_args = list(serve_args)
         self._sessions: dict[str, Session] = {}
         self._initialized = False
+        self._features = EditorFeatures()
         self._methods: dict[str, Callable[[Params], Awaitable[Any]]] = {
             "initialize": self._initialize,
             "session/new": self._new,
@@ -81,8 +82,9 @@ class Agent:
 
     # Methods
 
-    async def _initialize(self, _params: Params) -> dict[str, Any]:
+    async def _initialize(self, params: Params) -> dict[str, Any]:
         self._initialized = True
+        self._features = _features(params.get("clientCapabilities"))
         return {
             "protocolVersion": PROTOCOL_VERSION,
             "agentCapabilities": CAPABILITIES,
@@ -195,10 +197,10 @@ class Agent:
         if not isinstance(blocks, list):
             raise RpcError(INVALID_PARAMS, "prompt must be an array of content blocks")
         try:
-            text = translate.prompt_text(blocks)
+            text, images = translate.prompt_content(blocks)
         except (ValueError, KeyError, TypeError) as error:
             raise RpcError(INVALID_PARAMS, str(error)) from None
-        return {"stopReason": await session.prompt(text)}
+        return {"stopReason": await session.prompt(text, images)}
 
     # Sessions
 
@@ -240,7 +242,7 @@ class Agent:
         try:
             _check_record(running.record, wanted)
             assert self.conn is not None
-            return await Session.attach(self.conn, running)
+            return await Session.attach(self.conn, running, self._features)
         except BaseException:
             await _stop(running)
             raise
@@ -254,6 +256,18 @@ class Agent:
         finally:
             if session.relay is not None:
                 await session.relay.stop()
+
+
+def _features(capabilities: Any) -> EditorFeatures:
+    """What the editor's ``clientCapabilities`` (anything malformed counts as none) say it can
+    do: form elicitation, and the ``notice`` update."""
+
+    def present(parent: Any, key: str) -> Any:
+        return parent.get(key) if isinstance(parent, dict) else None
+
+    elicitation = present(present(capabilities, "elicitation"), "form") is not None
+    notices = present(present(capabilities, "session"), "notices") is not None
+    return EditorFeatures(elicitation=elicitation, notices=notices)
 
 
 def _check_record(record: serve.ServeRecord, wanted: str | None) -> None:

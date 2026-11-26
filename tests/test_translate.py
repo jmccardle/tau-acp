@@ -1,5 +1,6 @@
 """The pure translation functions, on τ's public value types."""
 
+import base64
 import json
 import struct
 import zlib
@@ -12,6 +13,7 @@ from tau import (
     Ending,
     Form,
     Image,
+    Notice,
     OpenQuestion,
     Outcome,
     Part,
@@ -31,14 +33,15 @@ def test_prompt_text_joins_blocks_with_a_blank_line():
         block(type="resource_link", name="a.py", uri="file:///a.py"),
         block(type="resource", resource={"uri": "file:///b.py", "text": "x = 1"}),
     ]
-    assert translate.prompt_text(blocks) == (
-        "look at this\n\n[a.py](file:///a.py)\n\nfile:///b.py\n```\nx = 1\n```"
+    assert translate.prompt_content(blocks) == (
+        "look at this\n\n[a.py](file:///a.py)\n\nfile:///b.py\n```\nx = 1\n```",
+        [],
     )
 
 
 def test_embedded_text_gets_a_fence_longer_than_its_backticks():
     resource = {"uri": "u", "text": "```py\nx\n```"}
-    assert translate.prompt_text([block(type="resource", resource=resource)]) == (
+    assert translate.prompt_content([block(type="resource", resource=resource)])[0] == (
         "u\n````\n```py\nx\n```\n````"
     )
 
@@ -46,7 +49,6 @@ def test_embedded_text_gets_a_fence_longer_than_its_backticks():
 @pytest.mark.parametrize(
     "bad",
     [
-        block(type="image", data="AA", mimeType="image/png"),
         block(type="audio", data="AA", mimeType="audio/wav"),
         block(type="resource", resource={"uri": "u", "blob": "AA"}),
         block(type="mystery"),
@@ -54,12 +56,12 @@ def test_embedded_text_gets_a_fence_longer_than_its_backticks():
 )
 def test_prompt_text_refuses_what_tau_cannot_take(bad):
     with pytest.raises(ValueError, match=r"cannot be sent|binary"):
-        translate.prompt_text([bad])
+        translate.prompt_content([bad])
 
 
 def test_prompt_text_refuses_an_empty_prompt():
     with pytest.raises(ValueError, match="empty"):
-        translate.prompt_text([])
+        translate.prompt_content([])
 
 
 @pytest.mark.parametrize(
@@ -166,7 +168,7 @@ def test_replay_of_a_walk():
         Node(3, Body.Results([("c", Outcome.Ok("done"), Author.Tools())]), 2),
         assistant([Part.Text("ok")], id=4),
     ]
-    updates = translate.replay_updates(nodes, "/w")
+    updates = translate.replay_updates(nodes, "/w", {})
     assert [u["sessionUpdate"] for u in updates] == [
         "user_message_chunk",
         "agent_message_chunk",
@@ -378,3 +380,133 @@ def test_images_in_a_result_are_a_line_each_after_its_text():
     assert update["content"] == [{"type": "content", "content": {"type": "text", "text": shown}}]
     assert update["rawOutput"] == shown
     assert translate.ok_text(Outcome.Ok("no pictures")) == "no pictures"
+
+
+def b64(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
+
+
+def test_image_blocks_become_image_inputs_after_the_text():
+    data = b64(png(2, 3))
+    blocks = [
+        block(type="image", data=data, mimeType="image/png"),
+        block(type="text", text="what is this"),
+    ]
+    text, images = translate.prompt_content(blocks)
+    assert text == "what is this"
+    assert [i.data for i in images] == [data]
+
+
+def test_an_image_alone_has_no_text():
+    blocks = [block(type="image", data=b64(png(1, 1)), mimeType="image/png")]
+    assert translate.prompt_content(blocks)[0] == ""
+
+
+@pytest.mark.parametrize("data", ["AA", "not base64!", None])
+def test_an_image_tau_would_refuse_is_refused_here(data):
+    with pytest.raises(ValueError, match="image"):
+        translate.prompt_content([block(type="image", data=data, mimeType="image/png")])
+
+
+def test_a_user_message_with_images_replays_text_then_image_blocks():
+    image = Image(png(3, 2))
+    node = Node(1, Body.User("look", [image]), 0)
+    assert translate.image_hashes([node]) == {image.sha256}
+    updates = translate.replay_updates([node], "/w", {image.sha256: "QUJD"})
+    assert updates == [
+        translate.chunk("user_message_chunk", "look"),
+        {
+            "sessionUpdate": "user_message_chunk",
+            "content": {"type": "image", "data": "QUJD", "mimeType": "image/png"},
+        },
+    ]
+
+
+def test_an_image_only_message_replays_no_empty_text_chunk():
+    image = Image(png(1, 1))
+    updates = translate.user_updates(Body.User("", [image]), {image.sha256: "QUJD"})
+    assert [u["content"]["type"] for u in updates] == ["image"]
+
+
+def test_a_notice_is_a_chat_line_with_its_extension_and_level():
+    assert translate.notice_text(Notice("hi")) == "\n[τ] hi\n"
+    warned = Notice("slow", extension="usage", level="warning")
+    assert translate.notice_text(warned) == "\n[usage] warning: slow\n"
+    assert translate.notice_update(warned, native=False)["sessionUpdate"] == "agent_message_chunk"
+
+
+def test_a_notice_is_acps_notice_when_the_editor_takes_it():
+    update = translate.notice_update(
+        Notice("slow", extension="usage", level="warning"), native=True
+    )
+    assert update == {"sessionUpdate": "notice", "severity": "warning", "title": "[usage] slow"}
+    long = translate.notice_update(Notice("first\nmore"), native=True)
+    assert long["title"] == "[τ] first"
+    assert long["description"] == "first\nmore"
+
+
+def reply(meta):
+    return Node(5, Body.Assistant([Part.Text("x")], Stop.End, None, meta), 4)
+
+
+def test_usage_update_is_the_replys_prompt_and_output_in_the_context_window():
+    node = reply(json.dumps({"usage": {"input": 100, "output": 20, "cached": 50}}))
+    assert translate.usage_update(node, 8000) == {
+        "sessionUpdate": "usage_update",
+        "used": 120,
+        "size": 8000,
+    }
+
+
+def test_no_usage_update_without_usage_or_a_window():
+    usage = json.dumps({"usage": {"input": 1, "output": 1}})
+    assert translate.usage_update(reply(None), 8000) is None
+    assert translate.usage_update(reply(json.dumps({"id": "x"})), 8000) is None
+    assert translate.usage_update(reply(usage), None) is None
+
+
+def test_a_usage_without_counts_is_an_error():
+    with pytest.raises(ValueError, match="input and output"):
+        translate.usage_update(reply(json.dumps({"usage": {"input": "many"}})), 8000)
+
+
+@pytest.mark.parametrize(
+    ("schema", "prop"),
+    [
+        ({"type": "string"}, {"type": "string"}),
+        ({"type": "boolean"}, {"type": "boolean"}),
+        ({"type": "integer"}, {"type": "integer"}),
+        ({"enum": ["a", "b"]}, {"type": "string", "enum": ["a", "b"]}),
+        ({"type": "array", "items": {"type": "string"}}, None),
+        ({"enum": [1, 2]}, None),
+        ({"anyOf": [{"type": "string"}, {"type": "null"}]}, None),
+    ],
+)
+def test_elicitation_property(schema, prop):
+    assert translate.elicitation_property(schema) == prop
+
+
+def test_elicitation_params_ask_one_field_named_answer():
+    question = OpenQuestion(7, None, "x", "Proceed?", {"type": "boolean"})
+    params = translate.elicitation_params(question, {"type": "boolean"})
+    assert params["mode"] == "form"
+    assert params["message"] == "Proceed?"
+    schema = params["requestedSchema"]
+    assert schema["properties"] == {"answer": {"type": "boolean", "title": "Answer"}}
+    assert schema["required"] == ["answer"]
+
+
+@pytest.mark.parametrize(
+    ("result", "answer"),
+    [
+        ({"action": "accept", "content": {"answer": True}}, True),
+        ({"action": "accept", "content": {"answer": "x"}}, "x"),
+        ({"action": "decline"}, None),
+        ({"action": "cancel"}, None),
+        ({"action": "accept"}, None),
+        ("nonsense", None),
+        (None, None),
+    ],
+)
+def test_elicitation_answer(result, answer):
+    assert translate.elicitation_answer(result) == answer

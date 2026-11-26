@@ -9,7 +9,7 @@ events itself, as τ's own ``tau -p`` does, until the cursor rests.
 
 import asyncio
 import contextlib
-from collections.abc import Awaitable, Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -17,10 +17,13 @@ from tau import (
     Appended,
     Body,
     Client,
+    Commands,
     ConfigError,
     CursorView,
     Ending,
     Event,
+    Form,
+    ImageInput,
     Live,
     Notice,
     OpenQuestion,
@@ -38,6 +41,8 @@ from tau_acp.jsonrpc import INTERNAL_ERROR, INVALID_PARAMS, Params, RpcError, lo
 Emit = Callable[[translate.Update], Awaitable[None]]
 Ask = Callable[[Params], Awaitable[Any]]
 ModelChanged = Callable[[str | None], Awaitable[None]]
+Elicit = Callable[[Params], Awaitable[Any]]
+ContextWindow = Callable[[str | None], int | None]
 PERMISSIONS = "permissions"
 PERMISSION_VALUES = ["yes", "always", "no"]
 PROGRESS_TAIL = 1 << 16  # characters of a running tool's output sent in a progress update
@@ -45,13 +50,19 @@ PROGRESS_TAIL = 1 << 16  # characters of a running tool's output sent in a progr
 
 @dataclass(frozen=True)
 class Editor:
-    """How the follower talks to the editor: the session's cwd, and sending an update and a
-    ``session/request_permission`` (whose result it returns) for the session."""
+    """How the follower talks to the editor: the session's cwd, and sending an update, a
+    ``session/request_permission`` and an ``elicitation/create`` (whose results it returns) for the
+    session. ``elicit`` is None when the editor did not advertise form elicitation, and
+    ``native_notices`` says whether it takes ACP's ``notice`` update. ``window`` is the context
+    window of a model, for ``usage_update``."""
 
     cwd: str
     emit: Emit
     ask: Ask
     model_changed: ModelChanged
+    elicit: Elicit | None
+    native_notices: bool
+    window: ContextWindow
 
 
 class Follower:
@@ -68,6 +79,12 @@ class Follower:
         self._emit = editor.emit
         self._ask = editor.ask
         self._model_changed = editor.model_changed
+        self._elicit = editor.elicit
+        self._native_notices = editor.native_notices
+        self._window = editor.window
+        self._forms: tuple[Form, ...] | None = None  # the last Commands heard
+        self._announced: dict[str, Any] | None = None  # the last command list sent
+        self._announcing = False  # whether the editor knows the session: commands may be sent
         self._stepped = False
         self._last_stop: Stop | None = None
         self._replies = 0  # the Assistant nodes of the prompt
@@ -80,6 +97,26 @@ class Follower:
         self._background: asyncio.Task[None] | None = None
         self._waiting = False  # the background task is blocked on the stream, holding no event
         self._paused = True
+
+    # Commands
+
+    def hear_commands(self, commands: Commands) -> None:
+        """Hold the commands (nothing is sent before ``announce_commands``)."""
+        self._forms = commands.forms
+
+    async def announce_commands(self) -> None:
+        """Send the ``available_commands_update`` for the last ``Commands`` heard, and from now on
+        each change of it (the editor knows the session once this is called)."""
+        self._announcing = True
+        await self._send_commands()
+
+    async def _send_commands(self) -> None:
+        if not self._announcing or self._forms is None:
+            return
+        update = translate.available_commands(self._forms)
+        if update != self._announced:
+            self._announced = update
+            await self._emit(update)
 
     # Between prompts
 
@@ -156,17 +193,20 @@ class Follower:
 
     # A prompt
 
-    async def run(self, text: str) -> str:
-        """Run the prompt text; the ACP stop reason, or ``RpcError``."""
+    async def run(self, text: str, images: Sequence[ImageInput] = ()) -> str:
+        """Run the prompt: its text, and the images that go with it. A line that starts with ``/``
+        is a command, which takes no images (``-32602``). The ACP stop reason, or ``RpcError``."""
         try:
             parsed = None
             if text.startswith("/"):
+                if images:
+                    raise RpcError(INVALID_PARAMS, "a slash command takes no images")
                 parsed = await self._parse(text)
             if self.cancelled:  # the cancel came while the line was being read: run nothing
                 return "cancelled"
             if parsed is not None:
                 return await self._command(parsed)
-            return await self._message(text)
+            return await self._message(text, images)
         except translate.TurnError as error:
             raise RpcError(INTERNAL_ERROR, str(error)) from None
 
@@ -196,8 +236,11 @@ class Follower:
             raise RpcError(INVALID_PARAMS, f"{name} needs: {', '.join(parsed.missing)}")
         return parsed
 
-    async def _message(self, text: str) -> str:
-        await self._client.send(self._cursor, text)
+    async def _message(self, text: str, images: Sequence[ImageInput]) -> str:
+        try:
+            await self._client.send(self._cursor, text, images)
+        except ValueError as error:  # τ's refusal: the model takes no images, a limit, a bad image
+            raise RpcError(INVALID_PARAMS, str(error)) from None
         if self.cancelled:  # the cancel came while the input was going in
             await self._client.abort(self._cursor)
         view = await self._rest()
@@ -320,8 +363,17 @@ class Follower:
         elif isinstance(event, Appended):
             for node in event.nodes:
                 await self._appended(node)
+        elif isinstance(event, Commands):
+            self._forms = event.forms
+            await self._send_commands()
         elif isinstance(event, Notice):
-            await self._emit(translate.chunk("agent_message_chunk", f"\n[τ] {event.text}\n"))
+            await self._notice(event)
+
+    async def _notice(self, notice: Notice) -> None:
+        if notice.cursor not in (None, self._cursor):
+            log(f"ignored a notice about cursor {notice.cursor}: {notice.text}")
+            return
+        await self._emit(translate.notice_update(notice, native=self._native_notices))
 
     def _seen(self, view: CursorView) -> None:
         if view.cursor != self._cursor:
@@ -360,14 +412,26 @@ class Follower:
             self._text = self._thought = ""
             self._last_stop = body.stop
             self._replies += 1
+            updates += self._usage(node)
         elif isinstance(body, Body.Results):
             updates = translate.results_updates(node)
         elif isinstance(body, Body.User) and not translate.is_own(node, self._client.id):
-            updates = [translate.chunk("user_message_chunk", body.text)]
+            images = {i.sha256: await self._client.image(i.sha256) for i in body.images}
+            updates = translate.user_updates(body, images)
         else:
             updates = []
         for update in updates:
             await self._emit(update)
+
+    def _usage(self, node: Any) -> list[translate.Update]:
+        """The ``usage_update`` for a reply, if it has one. A usage τ's documented shape does not
+        hold is logged, and the reply is translated all the same: usage is a report."""
+        try:
+            update = translate.usage_update(node, self._window(self.view.model))
+        except ValueError as error:
+            log(f"no usage_update: {error}")
+            return []
+        return [] if update is None else [update]
 
     # Questions
 
@@ -385,6 +449,8 @@ class Follower:
                 and question.schema.get("enum") == PERMISSION_VALUES
             ):
                 await self._permission(question, at)
+            elif (prop := translate.elicitation_property(question.schema)) and self._elicit:
+                await self._elicitation(question, prop)
             else:
                 text = f"[tau-acp] declined a question ACP cannot carry: {question.text}"
                 await self._emit(translate.chunk("agent_message_chunk", text))
@@ -407,6 +473,17 @@ class Follower:
             log(f"the client refused session/request_permission: {error.message}")
             result = None
         await self._answer(question.id, translate.permission_answer(result))
+
+    async def _elicitation(self, question: OpenQuestion, prop: dict[str, Any]) -> None:
+        """Ask the editor's user through ``elicitation/create``; a refusal or a cancel declines."""
+        assert self._elicit is not None
+        params = translate.elicitation_params(question, prop)
+        try:
+            result = await self._elicit(params)
+        except RpcError as error:
+            log(f"the client refused elicitation/create: {error.message}")
+            result = None
+        await self._answer(question.id, translate.elicitation_answer(result))
 
     async def _answer(self, question: int, value: object) -> None:
         with contextlib.suppress(LookupError):  # closed already: the first good answer won

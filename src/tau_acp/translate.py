@@ -9,7 +9,20 @@ import re
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
-from tau import Author, Body, CursorView, Ending, Form, Node, OpenQuestion, Outcome, Part, Stop
+from tau import (
+    Author,
+    Body,
+    CursorView,
+    Ending,
+    Form,
+    ImageInput,
+    Node,
+    Notice,
+    OpenQuestion,
+    Outcome,
+    Part,
+    Stop,
+)
 
 Update = dict[str, Any]
 
@@ -43,7 +56,8 @@ def _fence(text: str) -> str:
     return "`" * max(3, longest + 1)
 
 
-def _block_text(block: Mapping[str, Any]) -> str:
+def _block_text(block: Mapping[str, Any]) -> str | None:
+    """The text a block contributes, or None for an image (which goes as an image)."""
     if not isinstance(block, Mapping):
         raise ValueError(f"a prompt content block must be an object, not {block!r:.40}")
     kind = block.get("type")
@@ -57,15 +71,31 @@ def _block_text(block: Mapping[str, Any]) -> str:
             raise ValueError("a binary embedded resource cannot be sent to τ: it takes text")
         fence = _fence(resource["text"])
         return f"{resource['uri']}\n{fence}\n{resource['text']}\n{fence}"
-    raise ValueError(f"a {kind!r} content block cannot be sent to τ: it takes text")
+    if kind == "image":
+        return None
+    raise ValueError(f"a {kind!r} content block cannot be sent to τ: it takes text and images")
 
 
-def prompt_text(blocks: Sequence[Mapping[str, Any]]) -> str:
-    """The prompt's blocks as one text, blocks separated by a blank line. ``ValueError`` for a
-    block τ cannot take (image, audio, a binary resource) or an empty prompt."""
+def _image(block: Mapping[str, Any]) -> ImageInput:
+    data = block.get("data")
+    if not isinstance(data, str):
+        raise ValueError("an image content block needs its bytes as base64 `data`")
+    try:
+        return ImageInput(data=data)  # τ checks the bytes: strict base64 of a PNG/JPEG/GIF/WebP
+    except ValueError as error:  # BadImage
+        raise ValueError(f"an image content block τ cannot take: {error}") from None
+
+
+def prompt_content(blocks: Sequence[Mapping[str, Any]]) -> tuple[str, list[ImageInput]]:
+    """The prompt as τ takes it: its text blocks as one text, separated by a blank line, and its
+    image blocks as τ's image inputs, in order (τ puts a message's images after its text).
+    ``ValueError`` for a block τ cannot take (audio, a binary resource, an image that is not
+    PNG, JPEG, GIF or WebP) or an empty prompt."""
     if not blocks:
         raise ValueError("the prompt is empty")
-    return "\n\n".join(_block_text(block) for block in blocks)
+    texts = [t for block in blocks if (t := _block_text(block)) is not None]
+    images = [_image(block) for block in blocks if block.get("type") == "image"]
+    return "\n\n".join(texts), images
 
 
 # Updates
@@ -224,13 +254,29 @@ def _remainder(kind: str, full: str, seen: str, marker: str | None) -> list[Upda
     return [chunk(kind, rest)] if rest else []
 
 
-def replay_updates(nodes: Iterable[Node], cwd: str) -> list[Update]:
-    """The updates that replay a walk: users, assistants part by part, and results."""
+def image_hashes(nodes: Iterable[Node]) -> set[str]:
+    """The sha256 of every image the User nodes carry: the bytes ``replay_updates`` needs."""
+    return {image.sha256 for n in nodes if isinstance(n.body, Body.User) for image in n.body.images}
+
+
+def user_updates(body: Body.User, images: Mapping[str, str]) -> list[Update]:
+    """The updates for a user's message: its text, then an ``image`` block per image. ``images``
+    maps each image's sha256 to its bytes as base64 (τ's ``Client.image``)."""
+    updates = [chunk("user_message_chunk", body.text)] if body.text or not body.images else []
+    for image in body.images:
+        content = {"type": "image", "data": images[image.sha256], "mimeType": image.mime}
+        updates.append({"sessionUpdate": "user_message_chunk", "content": content})
+    return updates
+
+
+def replay_updates(nodes: Iterable[Node], cwd: str, images: Mapping[str, str]) -> list[Update]:
+    """The updates that replay a walk: users, assistants part by part, and results. ``images``
+    holds the bytes of ``image_hashes(nodes)``."""
     updates: list[Update] = []
     for node in nodes:
         body = node.body
         if isinstance(body, Body.User):
-            updates.append(chunk("user_message_chunk", body.text))
+            updates += user_updates(body, images)
         elif isinstance(body, Body.Assistant):
             updates += assistant_updates(node, cwd)
         elif isinstance(body, Body.Results):
@@ -270,6 +316,91 @@ def available_commands(forms: Sequence[Form]) -> Update:
             command["input"] = {"hint": hint}
         commands.append(command)
     return {"sessionUpdate": "available_commands_update", "availableCommands": commands}
+
+
+# Notices
+
+
+def notice_text(notice: Notice) -> str:
+    """A notice as chat text: ``[extension] text``, or ``[τ] text`` when τ itself said it, with
+    the level named when it is not ``info``."""
+    who = notice.extension or "τ"
+    level = "" if notice.level == "info" else f"{notice.level}: "
+    return f"\n[{who}] {level}{notice.text}\n"
+
+
+def notice_update(notice: Notice, *, native: bool) -> Update:
+    """The update for a notice: ACP's ``notice`` (severity, title, description) when the client
+    advertised it, else a message chunk."""
+    if not native:
+        return chunk("agent_message_chunk", notice_text(notice))
+    first, _, rest = notice.text.strip().partition("\n")
+    title = f"[{notice.extension or 'τ'}] {_cut(first)}"
+    update: Update = {"sessionUpdate": "notice", "severity": notice.level, "title": title}
+    if rest.strip() or len(first) > TITLE_WIDTH:
+        update["description"] = notice.text
+    return update
+
+
+# Usage
+
+
+def usage_update(node: Node, window: int | None) -> Update | None:
+    """ACP's ``usage_update`` for an Assistant node: ``used`` is the reply's prompt and output
+    tokens (τ's own ``ctx`` rule), ``size`` the model's ``context_window``. None when the reply
+    reported no usage or the model has no context window: ``size`` is required, and unknown.
+    ``ValueError`` when ``meta.usage`` is not the shape τ documents."""
+    body = node.body
+    assert isinstance(body, Body.Assistant)
+    if body.meta is None or window is None:
+        return None
+    meta = json.loads(body.meta)
+    usage = meta.get("usage") if isinstance(meta, dict) else None
+    if usage is None:
+        return None
+    counts = [usage.get(key) if isinstance(usage, dict) else None for key in ("input", "output")]
+    if not all(isinstance(c, int) and not isinstance(c, bool) and c >= 0 for c in counts):
+        raise ValueError(f"node {node.id}: meta.usage has no input and output counts: {usage!r}")
+    return {"sessionUpdate": "usage_update", "used": sum(counts), "size": window}
+
+
+# Questions
+
+
+def elicitation_property(schema: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The ACP form property for the JSON Schema of a τ question's answer, or None when a form
+    cannot ask it: a string, a boolean, an integer, a number, or one of some strings."""
+    choices = schema.get("enum")
+    if isinstance(choices, list) and choices and all(isinstance(c, str) for c in choices):
+        return {"type": "string", "enum": choices}
+    kind = schema.get("type")
+    if kind in ("string", "boolean", "integer", "number") and set(schema) <= {"type", "title"}:
+        return {"type": kind}
+    return None
+
+
+def elicitation_params(question: OpenQuestion, prop: Mapping[str, Any]) -> dict[str, Any]:
+    """The params of an ``elicitation/create`` (form mode) that asks a τ question: one field,
+    ``answer``."""
+    field = {**prop, "title": "Answer"}
+    return {
+        "mode": "form",
+        "message": question.text,
+        "requestedSchema": {
+            "type": "object",
+            "properties": {"answer": field},
+            "required": ["answer"],
+        },
+    }
+
+
+def elicitation_answer(result: Any) -> object | None:
+    """τ's answer for the client's response: the ``answer`` field of an accepted form, else None
+    (decline: ``decline``, ``cancel``, or anything malformed)."""
+    if not isinstance(result, dict) or result.get("action") != "accept":
+        return None
+    content = result.get("content")
+    return content.get("answer") if isinstance(content, dict) else None
 
 
 # Permissions

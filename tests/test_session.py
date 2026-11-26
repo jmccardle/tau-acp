@@ -24,7 +24,7 @@ async def test_initialize_shape(env):
         caps = dump["agentCapabilities"]
         assert caps["loadSession"] is True
         assert caps["promptCapabilities"] == {
-            "image": False,
+            "image": True,
             "audio": False,
             "embeddedContext": True,
         }

@@ -13,8 +13,12 @@ requires-python = ">=3.12"
 dependencies = [
     # Deliberately pinned to one τ minor series: τ's wire protocol number must
     # match exactly between client and server, so a τ bump needs a tau-acp release.
-    "ffwf-tau>=0.17,<0.18",
+    "ffwf-tau>=0.18,<0.19",
 ]
+
+[project.urls]
+Homepage = "https://github.com/jmccardle/tau-acp"
+Repository = "https://github.com/jmccardle/tau-acp"
 
 [project.scripts]
 tau-acp = "tau_acp.cli:main"

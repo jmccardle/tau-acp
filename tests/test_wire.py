@@ -33,7 +33,7 @@ async def test_initialize_on_the_wire(env):
         caps = result["agentCapabilities"]
         assert caps["loadSession"] is True
         assert caps["promptCapabilities"] == {
-            "image": False,
+            "image": True,
             "audio": False,
             "embeddedContext": True,
         }
